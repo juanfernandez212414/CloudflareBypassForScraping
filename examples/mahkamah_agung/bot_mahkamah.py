@@ -87,6 +87,7 @@ DB_NAME = os.environ.get("DB_NAME", os.path.join(DOWNLOAD_DIR, "bot_state.db"))
 WORKERS = int(os.environ.get("WORKERS", "24"))            # unduhan paralel
 CRAWL_WORKERS = int(os.environ.get("CRAWL_WORKERS", "6"))  # halaman daftar paralel
 REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "4"))    # batas total request ke situs MA
+START_REQ_PER_SEC = float(os.environ.get("START_REQ_PER_SEC", "1"))  # kecepatan awal, naik bertahap
 TARGET_DAYS = float(os.environ.get("TARGET_DAYS", "7"))   # target selesai sejak bot pertama jalan
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "5"))
 MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "2"))   # jeda unduh bila disk hampir penuh
@@ -214,18 +215,22 @@ class DB:
 class RateLimiter:
     """Batas request global (semua thread) yang menyesuaikan diri dengan situs.
 
-    REQ_PER_SEC adalah batas atas. Situs MA membatasi request per IP (HTTP 429)
-    dan melambat/timeout bila kewalahan; setiap tanda itu memotong kecepatan
-    jadi separuh, lalu kecepatan naik pelan-pelan (+15% tiap 2 menit lancar)."""
+    REQ_PER_SEC adalah batas atas; bot mulai dari START_REQ_PER_SEC. HTTP 429/5xx
+    (situs membatasi) memotong kecepatan jadi separuh. Timeout hanya dihitung
+    bila sering (>= separuh dari 20 request terakhir): situs MA kadang lambat
+    walau hanya dibuka satu request, dan itu bukan tanda bot terlalu cepat.
+    Setelah 1 menit tanpa pembatasan, kecepatan naik 25%."""
 
-    MIN_RATE, CUT_EVERY, RAISE_EVERY = 0.05, 30, 120
+    MIN_RATE, CUT_EVERY, RAISE_EVERY = 0.05, 30, 60
 
     def __init__(self, per_sec):
-        self.max_rate = self.rate = per_sec
+        self.max_rate = per_sec
+        self.rate = min(per_sec, START_REQ_PER_SEC)
         self.lock = threading.Lock()
         self.next_at = 0.0
         self.changed_at = time.monotonic()
         self.cut_at = float("-inf")
+        self.recent = collections.deque(maxlen=20)  # True = berhasil, False = timeout
 
     def wait(self, stop):
         with self.lock:
@@ -235,21 +240,34 @@ class RateLimiter:
         if stop.wait(max(0.0, at - time.monotonic())):
             raise Stopped()
 
-    def slow_down(self, reason, pause=0):
+    def _cut(self, reason, now):
+        # request yang sedang berjalan bisa gagal bersamaan: satu potongan per 30 dtk
+        if now - self.cut_at >= self.CUT_EVERY and self.rate > self.MIN_RATE:
+            self.rate = max(self.MIN_RATE, self.rate / 2)
+            self.changed_at = self.cut_at = now
+            log.warning("Situs membatasi/kewalahan (%s): kecepatan diturunkan ke %.2f req/dtk", reason, self.rate)
+
+    def limited(self, reason, pause=0):
+        """HTTP 429/5xx: situs jelas membatasi."""
         with self.lock:
             now = time.monotonic()
-            # request yang sedang berjalan bisa gagal bersamaan: satu potongan per 30 dtk
-            if now - self.cut_at >= self.CUT_EVERY and self.rate > self.MIN_RATE:
-                self.rate = max(self.MIN_RATE, self.rate / 2)
-                self.changed_at = self.cut_at = now
-                log.warning("Situs membatasi/kewalahan (%s): kecepatan diturunkan ke %.2f req/dtk", reason, self.rate)
+            self._cut(reason, now)
             self.next_at = max(self.next_at, now + pause)
 
-    def speed_up(self):
+    def timed_out(self):
         with self.lock:
+            self.recent.append(False)
+            if len(self.recent) >= 10 and self.recent.count(False) * 2 >= len(self.recent):
+                self._cut(f"{self.recent.count(False)} dari {len(self.recent)} request terakhir timeout",
+                          time.monotonic())
+
+    def succeeded(self):
+        with self.lock:
+            self.recent.append(True)
             now = time.monotonic()
-            if self.rate < self.max_rate and now - self.changed_at >= self.RAISE_EVERY:
-                self.rate = min(self.max_rate, self.rate * 1.15)
+            if (self.rate < self.max_rate and now - self.changed_at >= self.RAISE_EVERY
+                    and now - self.cut_at >= self.RAISE_EVERY):
+                self.rate = min(self.max_rate, self.rate * 1.25)
                 self.changed_at = now
                 log.info("Situs lancar: kecepatan dinaikkan ke %.2f req/dtk", self.rate)
 
@@ -411,8 +429,7 @@ class Http:
             except Exception as e:
                 self.metrics.add(url, time.monotonic() - started, "jaringan")
                 last_error = f"jaringan: {e}"
-                # timeout = server kewalahan: kurangi tekanan, bukan menambah
-                self.limiter.slow_down("timeout/jaringan")
+                self.limiter.timed_out()
             else:
                 elapsed = self.local.last_seconds = time.monotonic() - started
                 code = r.status_code
@@ -426,7 +443,7 @@ class Http:
                     retry_after = r.headers.get("retry-after", "")
                     wait = min(int(retry_after), 600) if retry_after.isdigit() else 0
                     wait = max(wait, BACKOFF * (attempt + 1))
-                    self.limiter.slow_down(f"HTTP {code}", pause=wait)
+                    self.limiter.limited(f"HTTP {code}", pause=wait)
                     if self.stop.wait(wait):
                         raise Stopped()
                     continue
@@ -440,7 +457,7 @@ class Http:
                 if code >= 400:
                     raise ParseError(f"HTTP {code}")
                 self.breaker.ok()
-                self.limiter.speed_up()
+                self.limiter.succeeded()
                 return r
             if self.stop.wait(5 * (attempt + 1)):
                 raise Stopped()
@@ -952,8 +969,8 @@ def site_lines(s):
              f"(maks {m['rate_limit']:g}) | respons: {latency}",
              f"- Gangguan (10 mnt): {issues}"]
     if limited:
-        lines.append("- Catatan: situs membatasi kecepatan (HTTP 429/timeout), bot otomatis memperlambat diri. "
-                     "Menaikkan REQ_PER_SEC/WORKERS tidak akan mempercepat.")
+        lines.append("- Catatan: bot berjalan di bawah REQ_PER_SEC karena situs membatasi (429/5xx/timeout) "
+                     "atau kecepatan sedang naik bertahap. Menaikkan REQ_PER_SEC/WORKERS tidak akan mempercepat.")
     elif m["avg"] and m["per_sec"] < 0.8 * rate_now:
         needed = math.ceil(rate_now * m["avg"] * 1.2)
         if needed > m["concurrency"]:

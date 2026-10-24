@@ -181,7 +181,7 @@ def stub():
 
 def run_bot(base, tmp_path, *args):
     env = dict(os.environ, MA_BASE_URL=base, BYPASS_URL=base, MA_YEAR="2025", MA_CAP_PAGES=str(CAP),
-               DOWNLOAD_DIR=str(tmp_path), REQ_PER_SEC="100", WORKERS="3", CRAWL_WORKERS="3", MAX_ATTEMPTS="1",
+               DOWNLOAD_DIR=str(tmp_path), REQ_PER_SEC="100", WORKERS="3", CRAWL_WORKERS="3", MAX_ATTEMPTS="1", START_REQ_PER_SEC="100",
                MIN_FREE_GB="0", BACKOFF_SECONDS="0.2",
                NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
     return subprocess.run([sys.executable, os.path.join(HERE, "bot_mahkamah.py"), *args],
@@ -336,4 +336,17 @@ def test_rate_limit_slows_down_instead_of_new_clearance(stub, tmp_path):
     db = sqlite3.connect(tmp_path / "bot_state.db")
     assert db.execute("SELECT COUNT(*) FROM docs WHERE status='DONE'").fetchone()[0] == len(DOCS) - 2
     stats = run_bot(stub, tmp_path, "stats").stdout
-    assert "429: 3" in stats and "situs membatasi kecepatan" in stats
+    assert "429: 3" in stats and "situs membatasi" in stats
+
+
+def test_sparse_timeouts_do_not_throttle_but_frequent_ones_do():
+    limiter = bot.RateLimiter(4)
+    start = limiter.rate
+    for i in range(20):  # 1 dari 5 request timeout: situs lambat, bukan dibatasi
+        limiter.timed_out() if i % 5 == 0 else limiter.succeeded()
+    assert limiter.rate == start
+    for _ in range(10):  # mayoritas timeout: kurangi tekanan
+        limiter.timed_out()
+    assert limiter.rate == start / 2
+    limiter.limited("HTTP 429")  # potongan berikutnya paling cepat 30 dtk kemudian
+    assert limiter.rate == start / 2
