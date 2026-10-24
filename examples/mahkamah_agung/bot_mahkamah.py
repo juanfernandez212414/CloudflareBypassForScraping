@@ -90,7 +90,7 @@ REPORT_FILE = os.environ.get("REPORT_FILE", os.path.join(DOWNLOAD_DIR, "laporan.
 REPORT_EVERY_MIN = int(os.environ.get("REPORT_EVERY_MIN", "60"))  # laporan otomatis selama bot jalan
 # Daftar dengan halaman terakhir >= angka ini dianggap terpotong oleh situs
 # (terlihat: kategori Korupsi 44.203 putusan tapi paginasi berhenti di 499).
-CAP_PAGES = int(os.environ.get("MA_CAP_PAGES", "450"))
+CAP_PAGES = int(os.environ.get("MA_CAP_PAGES", "499"))
 MAX_SPLIT_DEPTH = 6
 
 # Struktur HTML (diverifikasi pada halaman asli situs MA). Halaman daftar punya
@@ -455,6 +455,14 @@ def pdf_path(doc_id):
 
 
 # ---------------------------------------------------------------------- crawl
+def is_capped(last, count, per_page=20):
+    """Apakah daftar terpotong situs? Jumlah di sidebar diutamakan bila ada:
+    PA Indramayu 8.961 putusan / 462 halaman muat utuh, jadi tidak dipecah."""
+    if count:
+        return count > (last + 1) * per_page
+    return last >= CAP_PAGES
+
+
 def split_children(filters, facets):
     """Pecah bagian yang terpotong. Kembalikan (dimensi, anak, crawl_induk).
 
@@ -510,9 +518,7 @@ def analyse_slice(db, http, path, label, depth, count):
             count = total
     n_new = db.add_docs(items)
     record_page(db, path, 1, items, n_new)
-    # terpotong bila paginasi mentok di batas situs, atau jumlah di sidebar
-    # lebih banyak daripada yang bisa ditampilkan halamannya
-    capped = last >= CAP_PAGES or bool(count and count > last * 20 + 20)
+    capped = is_capped(last, count, per_page=max(len(items), 1))
     status = "CRAWL"
     if capped and depth < MAX_SPLIT_DEPTH:
         dimension, kids, crawl_parent = split_children(parse_filters(path + ".html"), facets)
@@ -927,7 +933,7 @@ def check(http):
         return False
 
     # 3. pemecahan: buka bagian pengadilan terbesar
-    capped = last >= CAP_PAGES or bool(total and total > last * 20 + 20)
+    capped = is_capped(last, total, per_page=max(len(items), 1))
     dimension, kids, _ = split_children(root, facets) if capped else (None, {}, False)
     if not capped:
         report(True, "Pemecahan daftar", "tidak perlu, daftar tidak terpotong")

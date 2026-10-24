@@ -200,6 +200,15 @@ def test_parse_list_ignores_sidebar_tabs_and_reads_facets():
     assert ({"tahunjenis": "putus", "tahun": "2025"}, "2025", len(DOCS)) in facets["tahun"]
 
 
+def test_is_capped_uses_real_numbers():
+    # angka asli dari situs MA (uji awal 24-10-2026)
+    assert bot.is_capped(499, 977_993)          # daftar tahun 2025
+    assert bot.is_capped(499, 28_244)           # Mahkamah Agung 2025
+    assert not bot.is_capped(462, 8_961)        # PA Indramayu 2025: muat utuh
+    assert bot.is_capped(bot.CAP_PAGES, None)   # tanpa jumlah: lihat batas halaman
+    assert not bot.is_capped(480, None)
+
+
 def test_split_order():
     facets = bot.parse_list(list_page("https://x", {"tahun": "2025", "tahunjenis": "putus"}, 1))[2]
     dim, kids, crawl_parent = bot.split_children({"tahun": "2025", "tahunjenis": "putus"}, facets)
