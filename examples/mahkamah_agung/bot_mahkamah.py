@@ -4,6 +4,11 @@ Bot unduh PDF putusan Mahkamah Agung (putusan3.mahkamahagung.go.id) skala besar.
 Cara kerja:
   - crawl    : telusuri halaman daftar per tahun -> simpan putusan ke SQLite
   - download : buka halaman detail tiap putusan -> simpan metadata + unduh PDF
+
+  Situs MA hanya menampilkan ±500 halaman (±10 rb putusan) per daftar, padahal
+  satu tahun bisa ±900 rb putusan. Karena itu daftar dipecah menjadi "bagian"
+  per pengadilan, lalu per kategori/klasifikasi bila masih terlalu besar,
+  memakai filter (beserta jumlahnya) di sidebar halaman daftar.
   Perintah `run` (bawaan) menjalankan keduanya bersamaan. Semua progres ada di
   SQLite, jadi bot bisa dihentikan/di-restart kapan saja dan lanjut sendiri.
 
@@ -35,7 +40,7 @@ import signal
 import sqlite3
 import threading
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -56,7 +61,8 @@ def load_env_file(path):
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+                    value = value.split(" #", 1)[0].strip().strip("'\"")
+                    os.environ.setdefault(key.strip(), value)
     except FileNotFoundError:
         pass
 
@@ -80,6 +86,10 @@ MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "2"))   # jeda unduh bila disk
 TIMEOUT = int(os.environ.get("TIMEOUT", "60"))
 REPORT_FILE = os.environ.get("REPORT_FILE", os.path.join(DOWNLOAD_DIR, "laporan.log"))
 REPORT_EVERY_MIN = int(os.environ.get("REPORT_EVERY_MIN", "60"))  # laporan otomatis selama bot jalan
+# Daftar dengan halaman terakhir >= angka ini dianggap terpotong oleh situs
+# (terlihat: kategori Korupsi 44.203 putusan tapi paginasi berhenti di 499).
+CAP_PAGES = int(os.environ.get("MA_CAP_PAGES", "450"))
+MAX_SPLIT_DEPTH = 6
 
 # Struktur HTML (diverifikasi pada halaman asli situs MA). Halaman daftar punya
 # tiga tab: #tabs-1 "Putusan" (daftar sebenarnya, 20/halaman), #tabs-2 "Penting"
@@ -87,6 +97,8 @@ REPORT_EVERY_MIN = int(os.environ.get("REPORT_EVERY_MIN", "60"))  # laporan otom
 SEL_LIST_ITEM = os.environ.get("SEL_LIST_ITEM", "#tabs-1 div.spost")
 SEL_PDF = os.environ.get("SEL_PDF", "a[href*='/direktori/download_file/'][href*='/pdf/']")
 RE_DETAIL = re.compile(r"/direktori/putusan/([A-Za-z0-9]+)\.html")
+RE_FILTER_PATH = re.compile(r"/direktori/index/(.+?)(?:/page/\d+)?\.html$")
+FILTER_ORDER = ("pengadilan", "kategori", "tahunjenis", "tahun")
 RE_LIST_DATE = re.compile(r"(Register|Putus|Upload)\s*:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})")
 CHALLENGE_MARKERS = ("Just a moment", "cf-chl", "challenge-platform", "cf-browser-verification",
                      "Attention Required", "Sorry, you have been blocked")
@@ -125,10 +137,20 @@ class DB:
         self.conn = sqlite3.connect(path, timeout=60, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        # versi lama menelusuri satu daftar saja (terpotong ±10 rb); progres
+        # halamannya tidak berlaku lagi, data putusan tetap dipakai
+        pages_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(pages)")}
+        if pages_cols and "slice" not in pages_cols:
+            self.conn.execute("DROP TABLE pages")
+            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='kv'").fetchone():
+                self.conn.execute("DELETE FROM kv WHERE k IN ('crawl_finished', 'last_page')")
         self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS slices (
+                path TEXT PRIMARY KEY, label TEXT, depth INTEGER, count INTEGER, last_page INTEGER,
+                status TEXT DEFAULT 'NEW', attempts INTEGER DEFAULT 0, error TEXT, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS pages (
-                page INTEGER PRIMARY KEY, status TEXT, n_links INTEGER, n_new INTEGER,
-                attempts INTEGER DEFAULT 0, error TEXT, updated_at TEXT);
+                slice TEXT, page INTEGER, status TEXT, n_links INTEGER, n_new INTEGER,
+                attempts INTEGER DEFAULT 0, error TEXT, updated_at TEXT, PRIMARY KEY (slice, page));
             CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
         """)
@@ -137,10 +159,9 @@ class DB:
         for col, decl in self.DOC_COLUMNS.items():
             if col not in have:
                 self.conn.execute(f"ALTER TABLE docs ADD COLUMN {col} {decl}")
-        have = {row[1] for row in self.conn.execute("PRAGMA table_info(pages)")}
-        for col, decl in {"n_new": "INTEGER", "attempts": "INTEGER DEFAULT 0", "error": "TEXT"}.items():
-            if col not in have:
-                self.conn.execute(f"ALTER TABLE pages ADD COLUMN {col} {decl}")
+        self.conn.execute("UPDATE docs SET status='PENDING' WHERE status IS NULL")
+        self.conn.execute("UPDATE docs SET attempts=0 WHERE attempts IS NULL")
+        self.conn.execute("UPDATE docs SET next_try=0 WHERE next_try IS NULL")
         self.conn.executescript("""
             CREATE INDEX IF NOT EXISTS docs_queue ON docs(status, next_try);
             CREATE INDEX IF NOT EXISTS docs_updated ON docs(status, updated_at);
@@ -173,8 +194,9 @@ class DB:
         with self.lock:
             before = self.conn.total_changes
             self.conn.executemany(
-                "INSERT OR IGNORE INTO docs (id, url, judul, tgl_register, tgl_putus, tgl_upload, added_at) "
-                "VALUES (:id, :url, :judul, :tgl_register, :tgl_putus, :tgl_upload, :added_at)",
+                "INSERT OR IGNORE INTO docs (id, url, judul, tgl_register, tgl_putus, tgl_upload, added_at, "
+                "status, attempts, next_try) VALUES (:id, :url, :judul, :tgl_register, :tgl_putus, :tgl_upload, "
+                ":added_at, 'PENDING', 0, 0)",
                 [dict(item, added_at=now_str()) for item in items])
             self.conn.commit()
             return self.conn.total_changes - before
@@ -289,6 +311,12 @@ class Http:
         # satu sesi per thread (koneksi keep-alive); dibuat ulang tiap clearance baru
         st = self.local
         if getattr(st, "generation", None) != self.bypass.generation:
+            old = getattr(st, "session", None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
             st.session = cffi.Session(impersonate="chrome") if cffi else requests.Session()
             st.generation = self.bypass.generation
         return st.session
@@ -317,7 +345,8 @@ class Http:
                     raise ParseError("HTTP 404")
                 if r.status_code == 429 or r.status_code >= 500:
                     last_error = f"HTTP {r.status_code}"
-                    wait = int(r.headers.get("retry-after", "0") or 0) if r.status_code == 429 else 0
+                    retry_after = r.headers.get("retry-after", "") if r.status_code == 429 else ""
+                    wait = min(int(retry_after), 600) if retry_after.isdigit() else 0
                     if self.stop.wait(max(wait, 10 * (attempt + 1))):
                         raise Stopped()
                     continue
@@ -332,12 +361,47 @@ class Http:
 
 
 # --------------------------------------------------------------------- parsing
-def list_url(page):
-    return f"{BASE_URL}{LIST_PATH}.html" if page == 1 else f"{BASE_URL}{LIST_PATH}/page/{page}.html"
+def parse_filters(href):
+    """'/direktori/index/pengadilan/pn-x/tahun/2025.html' -> {'pengadilan': 'pn-x', 'tahun': '2025'}"""
+    match = RE_FILTER_PATH.search(urlparse(href).path)
+    if not match:
+        return {}
+    parts = match.group(1).split("/")
+    return dict(zip(parts[::2], parts[1::2])) if len(parts) % 2 == 0 else {}
+
+
+def filters_path(filters):
+    keys = [k for k in FILTER_ORDER if k in filters] + sorted(k for k in filters if k not in FILTER_ORDER)
+    return "/direktori/index/" + "/".join(f"{k}/{filters[k]}" for k in keys)
+
+
+ROOT_PATH = filters_path(parse_filters(LIST_PATH + ".html"))
+
+
+def list_url(path, page):
+    return f"{BASE_URL}{path}.html" if page == 1 else f"{BASE_URL}{path}/page/{page}.html"
+
+
+def parse_facets(soup):
+    """Filter di sidebar: {judul kartu: [(filter, label, jumlah)]}, mis. kartu
+    'pengadilan' berisi tiap pengadilan beserta jumlah putusannya."""
+    facets = {}
+    for card in soup.select("div.card"):
+        head = card.select_one(".card-header")
+        title = head.get_text(" ", strip=True).lower() if head else ""
+        for badge in card.select("a span.badge"):
+            link = badge.find_parent("a")
+            filters = parse_filters(link.get("href", ""))
+            if not filters:
+                continue
+            label = " ".join(t.strip() for t in link.find_all(string=True, recursive=False)).strip()
+            digits = re.sub(r"\D", "", badge.get_text())
+            facets.setdefault(title, []).append((filters, label, int(digits) if digits else None))
+    return facets
 
 
 def parse_list(html):
-    """Kembalikan (daftar putusan, nomor halaman terakhir) dari halaman daftar."""
+    """Kembalikan (daftar putusan, nomor halaman terakhir, filter sidebar)."""
     soup = BeautifulSoup(html, "html.parser")
     items, seen = [], set()
     for entry in soup.select(SEL_LIST_ITEM):
@@ -360,7 +424,7 @@ def parse_list(html):
         for candidate in (value, match.group(1) if match else ""):
             if candidate.isdigit():
                 last = max(last, int(candidate))
-    return items, last
+    return items, last, parse_facets(soup)
 
 
 def parse_detail(html):
@@ -389,48 +453,160 @@ def pdf_path(doc_id):
 
 
 # ---------------------------------------------------------------------- crawl
-def crawl(db, http, stop):
-    """Telusuri semua halaman daftar yang belum selesai."""
-    first = http.get(list_url(1))
-    items, last = parse_list(first.text)
-    if not items:
-        raise ParseError(f"Tidak ada putusan di {list_url(1)}. Struktur HTML berubah? Cek SEL_LIST_ITEM.")
-    db.set_kv("last_page", last)
-    done = {row[0] for row in db.query("SELECT page FROM pages WHERE status IN ('DONE', 'FAILED')")}
-    log.info("Crawl: %d halaman (±%d putusan), %d sudah selesai", last, last * 20, len(done))
-    page = 1
+def split_children(filters, facets):
+    """Pecah bagian yang terpotong. Kembalikan (dimensi, anak, crawl_induk).
+
+    Urutan: per pengadilan (tiap putusan tepat di satu pengadilan), lalu per
+    kategori utama, lalu per klasifikasi. Klasifikasi bisa tidak mencakup
+    putusan yang hanya diberi kategori induk, jadi induknya tetap ditelusuri
+    sejauh yang ditampilkan situs (crawl_induk=True)."""
+    def card(name):
+        return [entry for title, entries in facets.items() if title.startswith(name) for entry in entries]
+
+    def children(key, entries, keep_count, skip=None):
+        out = {}
+        for f, label, count in entries:
+            if f.get(key) and f[key] != skip:
+                child = dict(filters, **{key: f[key]})
+                out.setdefault(filters_path(child), (label, count if keep_count else None))
+        return out
+
+    if "pengadilan" not in filters:
+        kids = children("pengadilan", card("pengadilan"), keep_count=True)
+        if kids:
+            return "pengadilan", kids, False
+    if "kategori" not in filters:
+        # kartu "Direktori" = daftar kategori utama (jumlahnya global, bukan per filter)
+        kids = children("kategori", card("direktori"), keep_count=False)
+        if kids:
+            return "kategori", kids, False
+    else:
+        kids = children("kategori", card("klasifikasi"), keep_count=False, skip=filters["kategori"])
+        if kids:
+            return "klasifikasi", kids, True
+    return None, {}, True
+
+
+def record_page(db, path, page, items, n_new):
+    db.execute("INSERT OR REPLACE INTO pages (slice, page, status, n_links, n_new, attempts, error, updated_at) "
+               "VALUES (?, ?, 'DONE', ?, ?, 0, NULL, ?)", (path, page, len(items), n_new, now_str()))
+
+
+def analyse_slice(db, http, path, label, depth, count):
+    """Ambil halaman 1 sebuah bagian; pecah bila daftarnya terpotong situs."""
+    items, last, facets = parse_list(http.get(list_url(path, 1)).text)
+    if depth == 0:
+        if not items:
+            raise ParseError(f"Tidak ada putusan di {list_url(path, 1)}. Struktur HTML berubah? "
+                             "Cek SEL_LIST_ITEM.")
+        # jumlah total tahun ini (kartu "Tahun") & jumlah per pengadilan, untuk laporan
+        root = parse_filters(path + ".html")
+        total = next((c for title, entries in facets.items() if title.startswith("tahun")
+                      for f, _, c in entries if f == root and c), None)
+        if total:
+            db.set_kv("expected_total", total)
+            count = total
+    n_new = db.add_docs(items)
+    record_page(db, path, 1, items, n_new)
+    # terpotong bila paginasi mentok di batas situs, atau jumlah di sidebar
+    # lebih banyak daripada yang bisa ditampilkan halamannya
+    capped = last >= CAP_PAGES or bool(count and count > last * 20 + 20)
+    status = "CRAWL"
+    if capped and depth < MAX_SPLIT_DEPTH:
+        dimension, kids, crawl_parent = split_children(parse_filters(path + ".html"), facets)
+        if kids:
+            with db.lock:
+                db.conn.executemany(
+                    "INSERT OR IGNORE INTO slices (path, label, depth, count, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    [(p, f"{label} > {lab}", depth + 1, c, now_str()) for p, (lab, c) in kids.items()])
+                db.conn.commit()
+            log.info("Bagian '%s' terpotong (%d halaman%s), dipecah per %s menjadi %d bagian",
+                     label, last, f", {count:,} putusan" if count else "", dimension, len(kids))
+            status = "CRAWL" if crawl_parent else "SPLIT"
+        else:
+            log.warning("Bagian '%s' terpotong di %d halaman dan tidak bisa dipecah lagi; "
+                        "sebagian putusannya mungkin tidak terjangkau", label, last)
+    elif capped:
+        log.warning("Bagian '%s' terpotong dan batas kedalaman pemecahan tercapai", label)
+    db.execute("UPDATE slices SET status=?, last_page=?, count=COALESCE(?, count), attempts=0, error=NULL, "
+               "updated_at=? WHERE path=?", (status, last, count, now_str(), path))
+
+
+def crawl_slice(db, http, stop, path, label, last):
+    """Telusuri semua halaman sebuah bagian yang belum selesai."""
+    done = {row[0] for row in db.query(
+        "SELECT page FROM pages WHERE slice=? AND status IN ('DONE', 'FAILED')", (path,))}
+    page, found = 1, 0
     while page <= last and not stop.is_set():
         if page in done:
             page += 1
             continue
         try:
-            html = first.text if page == 1 else http.get(list_url(page), referer=list_url(page - 1)).text
-            items, page_last = parse_list(html)
-            if not items:
-                raise ParseError("halaman daftar kosong")
+            html = http.get(list_url(path, page), referer=list_url(path, page - 1)).text
+            items, page_last, _ = parse_list(html)
             n_new = db.add_docs(items)
-            db.execute("INSERT OR REPLACE INTO pages (page, status, n_links, n_new, attempts, error, updated_at) "
-                       "VALUES (?, 'DONE', ?, ?, 0, NULL, ?)", (page, len(items), n_new, now_str()))
-            if page_last > last:
-                last = page_last
-                db.set_kv("last_page", last)
-            if page % 50 == 0 or page == last:
-                log.info("Crawl halaman %d/%d (+%d putusan baru)", page, last, n_new)
+            record_page(db, path, page, items, n_new)
+            found += n_new
+            if not items:
+                break  # halaman kosong = akhir daftar
+            last = max(last, min(page_last, CAP_PAGES + 100))
+            if page % 50 == 0:
+                log.info("Bagian '%s': halaman %d/%d", label, page, last)
         except Stopped:
-            break
-        except (TransientError, ParseError) as e:
-            attempts = (db.scalar("SELECT attempts FROM pages WHERE page=?", (page,)) or 0) + 1
+            return
+        except Exception as e:
+            attempts = (db.scalar("SELECT attempts FROM pages WHERE slice=? AND page=?", (path, page)) or 0) + 1
             status = "FAILED" if attempts >= MAX_ATTEMPTS else "PENDING"
-            db.execute("INSERT OR REPLACE INTO pages (page, status, attempts, error, updated_at) "
-                       "VALUES (?, ?, ?, ?, ?)", (page, status, attempts, str(e)[:500], now_str()))
-            log.warning("Halaman %d gagal (%d/%d): %s", page, attempts, MAX_ATTEMPTS, e)
+            db.execute("INSERT OR REPLACE INTO pages (slice, page, status, attempts, error, updated_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?)", (path, page, status, attempts, str(e)[:500], now_str()))
+            log.warning("Bagian '%s' halaman %d gagal (%d/%d): %s", label, page, attempts, MAX_ATTEMPTS, e)
             if status == "PENDING":
-                stop.wait(30)
+                if stop.wait(30):
+                    return
                 continue
         page += 1
     if not stop.is_set():
-        db.set_kv("crawl_finished", now_str())
-        log.info("Crawl selesai sampai halaman %d", last)
+        db.execute("UPDATE slices SET status='DONE', last_page=?, updated_at=? WHERE path=?",
+                   (last, now_str(), path))
+        log.info("Bagian '%s' selesai: %d halaman, +%d putusan baru", label, last, found)
+
+
+def crawl(db, http, stop):
+    """Telusuri daftar tahun ini, dipecah per bagian sampai semuanya selesai."""
+    db.execute("INSERT OR IGNORE INTO slices (path, label, depth, updated_at) VALUES (?, ?, 0, ?)",
+               (ROOT_PATH, f"Tahun {YEAR}", now_str()))
+    while not stop.is_set():
+        rows = db.query("SELECT path, label, depth, count, status, last_page FROM slices "
+                        "WHERE status IN ('NEW', 'CRAWL') ORDER BY rowid LIMIT 1")
+        if not rows:
+            break
+        path, label, depth, count, status, last = rows[0]
+        if status == "CRAWL":
+            crawl_slice(db, http, stop, path, label, last or 1)
+            continue
+        try:
+            analyse_slice(db, http, path, label, depth, count)
+        except Stopped:
+            return
+        except Exception as e:
+            if depth == 0 and isinstance(e, ParseError):
+                raise
+            attempts = (db.scalar("SELECT attempts FROM slices WHERE path=?", (path,)) or 0) + 1
+            status = "FAILED" if attempts >= MAX_ATTEMPTS else "NEW"
+            db.execute("UPDATE slices SET status=?, attempts=?, error=?, updated_at=? WHERE path=?",
+                       (status, attempts, str(e)[:500], now_str(), path))
+            log.warning("Bagian '%s' gagal dibuka (%d/%d): %s", label, attempts, MAX_ATTEMPTS, e)
+            if status == "NEW" and stop.wait(30):
+                return
+    if stop.is_set():
+        return
+    db.set_kv("crawl_finished", now_str())
+    total = db.scalar("SELECT COUNT(*) FROM docs")
+    expected = int(db.get_kv("expected_total", 0))
+    log.info("Crawl selesai: %d putusan terdaftar%s", total, f" dari {expected:,} menurut situs" if expected else "")
+    if expected and total < expected * 0.98:
+        log.warning("Putusan terdaftar (%d) jauh di bawah jumlah di situs (%d). Cek bagian yang gagal/terpotong "
+                    "di log, lalu jalankan retry-failed.", total, expected)
 
 
 def update(db, http, stop, quiet_pages=3):
@@ -439,7 +615,7 @@ def update(db, http, stop, quiet_pages=3):
     page, quiet, total_new = 1, 0, 0
     while quiet < quiet_pages and not stop.is_set():
         try:
-            items, last = parse_list(http.get(list_url(page)).text)
+            items, last, _ = parse_list(http.get(list_url(ROOT_PATH, page)).text)
         except Stopped:
             break
         except (TransientError, ParseError) as e:
@@ -452,6 +628,7 @@ def update(db, http, stop, quiet_pages=3):
             break
         page += 1
     log.info("Update: %d putusan baru dari %d halaman awal", total_new, page)
+    return total_new
 
 
 # ------------------------------------------------------------------- download
@@ -484,10 +661,12 @@ def download_one(db, http, stop, doc_id, url):
         r = http.get(pdf_url, referer=url)
         body = r.content
         # tanpa cek ini, halaman error HTML bisa tersimpan sebagai .pdf
-        if not body.startswith(b"%PDF"):
+        if b"%PDF" not in body[:1024]:
             raise ParseError(f"bukan PDF (content-type={r.headers.get('content-type')}, {len(body)} byte)")
-        expected = r.headers.get("content-length")
-        if expected and expected.isdigit() and int(expected) != len(body):
+        # Content-Length hanya bisa dibandingkan bila respons tidak dikompres
+        expected = r.headers.get("content-length", "")
+        encoded = r.headers.get("content-encoding", "identity").lower() not in ("", "identity")
+        if expected.isdigit() and not encoded and int(expected) != len(body):
             raise TransientError(f"unduhan terpotong ({len(body)}/{expected} byte)")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".part"
@@ -496,7 +675,14 @@ def download_one(db, http, stop, doc_id, url):
         os.replace(tmp, path)
         db.execute("UPDATE docs SET status='DONE', file=?, size=?, error=NULL, updated_at=? WHERE id=?",
                    (path, len(body), now_str(), doc_id))
-    except (TransientError, ParseError, OSError) as e:
+    except Stopped:
+        raise
+    except Exception as e:
+        # semua error lain juga dicatat; tanpa ini putusan langsung diambil
+        # ulang oleh antrean dan dicoba terus-menerus tanpa jeda
+        if not isinstance(e, (TransientError, ParseError, OSError)):
+            log.exception("Error tak terduga pada %s", doc_id)
+            e = f"{type(e).__name__}: {e}"
         attempts = (db.scalar("SELECT attempts FROM docs WHERE id=?", (doc_id,)) or 0) + 1
         status = "FAILED" if attempts >= MAX_ATTEMPTS else "PENDING"
         # coba lagi nanti dengan jeda bertambah: 10, 20, 40, 80 menit
@@ -565,7 +751,7 @@ def collect_stats(db):
     counts = dict(db.query("SELECT status, COUNT(*) FROM docs GROUP BY status"))
     hour_ago = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 3600))
     day_ago = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400))
-    last_page = int(db.get_kv("last_page", 0))
+    slices = dict(db.query("SELECT status, COUNT(*) FROM slices GROUP BY status"))
     s = {
         "total": sum(counts.values()),
         "done": counts.get("DONE", 0), "pending": counts.get("PENDING", 0),
@@ -575,14 +761,17 @@ def collect_stats(db):
         "bytes": db.scalar("SELECT COALESCE(SUM(size), 0) FROM docs WHERE status='DONE'"),
         "pages_done": db.scalar("SELECT COUNT(*) FROM pages WHERE status='DONE'"),
         "pages_failed": db.scalar("SELECT COUNT(*) FROM pages WHERE status='FAILED'"),
-        "last_page": last_page,
+        "slices_total": sum(slices.values()),
+        "slices_done": slices.get("DONE", 0) + slices.get("SPLIT", 0),
+        "slices_failed": slices.get("FAILED", 0),
+        "expected_total": int(db.get_kv("expected_total", 0)),
         "crawl_finished": db.get_kv("crawl_finished"),
         "heartbeat": float(db.get_kv("heartbeat", 0)),
         "stopped_at": float(db.get_kv("stopped_at", 0)),
         "disk_free": shutil.disk_usage(DOWNLOAD_DIR).free,
     }
-    # perkiraan total: dari crawl bila sudah selesai, kalau belum dari jumlah halaman
-    s["estimate"] = s["total"] if s["crawl_finished"] else max(s["total"], last_page * 20)
+    # perkiraan total: jumlah menurut situs (kartu "Tahun"), atau yang sudah terdaftar
+    s["estimate"] = max(s["total"], s["expected_total"])
     remaining = s["estimate"] - s["done"] - s["no_pdf"] - s["failed"]
     # pakai laju 1 jam terakhir (paling mutakhir), atau rata-rata 24 jam
     s["per_hour"] = s["last_hour"] or s["last_day"] / 24
@@ -639,7 +828,10 @@ def format_stats(s):
     except requests.RequestException:
         bypass = "MATI"
     pct = 100 * s["done"] / s["estimate"] if s["estimate"] else 0
-    crawl = "selesai" if s["crawl_finished"] else f"{s['pages_done']}/{s['last_page'] or '?'} halaman"
+    crawl = "selesai" if s["crawl_finished"] else "berjalan"
+    crawl += (f", {s['slices_done']:,}/{s['slices_total']:,} bagian, {s['pages_done']:,} halaman"
+              f" (gagal: {s['slices_failed']} bagian, {s['pages_failed']} halaman)")
+    site = f" dari ±{s['expected_total']:,} di situs" if s["expected_total"] else ""
     if s["remaining"] <= 0:
         eta = "sudah selesai"
     else:
@@ -650,7 +842,8 @@ def format_stats(s):
         f"- Terunduh: {s['done']:,} / ±{s['estimate']:,} ({pct:.1f}%)",
         f"- 24 jam terakhir: +{s['last_day']:,} | 1 jam terakhir: +{s['last_hour']:,}",
         f"- Antre: {s['pending']:,} | Gagal: {s['failed']:,} | Tanpa PDF: {s['no_pdf']:,}",
-        f"- Crawl daftar: {crawl} (gagal: {s['pages_failed']})",
+        f"- Crawl daftar: {crawl}",
+        f"- Putusan terdaftar: {s['total']:,}{site}",
         f"- Ukuran: {human_bytes(s['bytes'])} (rata-rata {avg}/file) | Sisa disk: {human_bytes(s['disk_free'])}",
         f"- Perkiraan selesai: {eta}",
         *target_lines(s),
@@ -672,12 +865,15 @@ def export_csv(db, path):
         writer = csv.writer(f)
         writer.writerow(["id", "nomor", "judul", "tgl_putus", "tgl_upload", *fields,
                          "status", "file", "nama_file", "pdf_url", "url"])
-        rows = db.query("SELECT id, nomor, judul, tgl_putus, tgl_upload, meta, status, file, "
-                        "nama_file, pdf_url, url FROM docs ORDER BY rowid")
-        for row in rows:
+        # dibaca bertahap: 900 rb baris sekaligus bisa menghabiskan RAM
+        cursor = db.conn.execute("SELECT id, nomor, judul, tgl_putus, tgl_upload, meta, status, file, "
+                                 "nama_file, pdf_url, url FROM docs ORDER BY rowid")
+        n = 0
+        for row in cursor:
             meta = json.loads(row[5]) if row[5] else {}
             writer.writerow([*row[:5], *(meta.get(k, "") for k in fields), *row[6:]])
-    print(f"{len(rows):,} baris diekspor ke {path}")
+            n += 1
+    print(f"{n:,} baris diekspor ke {path}")
 
 
 # ----------------------------------------------------------------------- main
@@ -711,10 +907,14 @@ def main(argv=None):
         return export_csv(db, args.output or os.path.join(DOWNLOAD_DIR, "metadata.csv"))
     if args.command == "retry-failed":
         n = db.execute("UPDATE docs SET status='PENDING', attempts=0, next_try=0 WHERE status='FAILED'").rowcount
+        # bagian yang punya halaman gagal ditelusuri ulang (halaman yang sudah selesai dilewati)
+        db.execute("UPDATE slices SET status='CRAWL' WHERE status='DONE' AND path IN "
+                   "(SELECT slice FROM pages WHERE status='FAILED')")
         p = db.execute("DELETE FROM pages WHERE status='FAILED'").rowcount
-        if p:
+        b = db.execute("UPDATE slices SET status='NEW', attempts=0 WHERE status='FAILED'").rowcount
+        if p or b:
             db.execute("DELETE FROM kv WHERE k='crawl_finished'")
-        return print(f"{n:,} putusan dan {p:,} halaman diantrekan ulang")
+        return print(f"{n:,} putusan, {b:,} bagian, dan {p:,} halaman diantrekan ulang")
 
     setup_logging()
     stop = threading.Event()
@@ -732,13 +932,13 @@ def main(argv=None):
         # tanda bot masih hidup (untuk status di laporan) + laporan berkala
         minutes = 0
         while not stop.wait(60):
-            db.set_kv("heartbeat", time.time())
             minutes += 1
-            if REPORT_EVERY_MIN > 0 and minutes % REPORT_EVERY_MIN == 0:
-                try:
+            try:
+                db.set_kv("heartbeat", time.time())
+                if REPORT_EVERY_MIN > 0 and minutes % REPORT_EVERY_MIN == 0:
                     log.info("Laporan:\n%s", write_report(db))
-                except Exception:
-                    log.exception("Gagal menulis laporan")
+            except Exception:
+                log.exception("Gagal memperbarui heartbeat/laporan")
 
     db.set_kv("heartbeat", time.time())
     if db.get_kv("started_at") is None:
@@ -780,6 +980,9 @@ def main(argv=None):
 
             threading.Thread(target=crawl_thread, name="crawl", daemon=True).start()
             download(db, http, stop, crawl_done)
+            # sebelum selesai, ambil putusan yang diunggah selama bot berjalan
+            while not stop.is_set() and update(db, http, stop) > 0:
+                download(db, http, stop, crawl_done)
     except Stopped:
         pass
     finally:

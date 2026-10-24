@@ -25,14 +25,34 @@ kredit untuk minimal 7 hari. Bot otomatis menjeda unduhan saat sisa disk di bawa
 
 ## Cara kerja
 
-1. **crawl**: menelusuri halaman daftar
-   `/direktori/index/tahunjenis/putus/tahun/2025/page/N.html` (20 putusan per
-   halaman), lalu menyimpan ID, judul, dan tanggal ke tabel `docs`. Hanya tab
-   "Putusan" (`#tabs-1`) yang diambil; tab "Penting" dan "Terpopuler" diabaikan.
-2. **download**: membuka halaman detail tiap putusan, menyimpan metadata
-   (nomor, lembaga peradilan, amar, dll.), lalu mengunduh PDF.
+**Batas daftar ±10 ribu putusan.** Situs MA hanya menampilkan sekitar 500
+halaman (±10 ribu putusan) untuk setiap daftar. Contohnya, kategori Korupsi
+berisi 44.203 putusan tetapi paginasinya berhenti di halaman 499. Sementara
+itu, satu tahun bisa berisi ±900 ribu putusan. Karena itu bot memecah daftar
+menjadi beberapa "bagian" memakai filter di sidebar halaman daftar:
 
-Perintah `run` (bawaan) menjalankan keduanya bersamaan.
+1. Daftar tahun 2025 dipecah **per pengadilan**. Setiap putusan tercatat di
+   tepat satu pengadilan, dan jumlah per pengadilan di sidebar terbukti persis
+   sama dengan totalnya.
+2. Pengadilan yang masih melebihi batas (misalnya Mahkamah Agung atau
+   Pengadilan Agama besar) dipecah lagi **per kategori**, lalu **per
+   klasifikasi** bila perlu. Daftar induknya juga tetap ditelusuri, supaya
+   putusan yang hanya diberi kategori induk tidak terlewat.
+
+Setelah itu ada dua tahap:
+
+- **crawl**: menelusuri semua halaman tiap bagian, lalu menyimpan ID, judul,
+  dan tanggal ke tabel `docs`. Hanya tab "Putusan" (`#tabs-1`) yang diambil;
+  tab "Penting" dan "Terpopuler" diabaikan.
+- **download**: membuka halaman detail tiap putusan, menyimpan metadata
+  (nomor, lembaga peradilan, amar, dll.), lalu mengunduh PDF.
+
+Perintah `run` (bawaan) menjalankan keduanya bersamaan. Begitu semua selesai,
+bot sekali lagi memeriksa putusan yang baru diunggah selama ia berjalan.
+
+Laporan menampilkan **Putusan terdaftar: X dari ±Y di situs**. Angka Y diambil
+dari jumlah di sidebar situs. Bila X jauh di bawah Y setelah crawl selesai,
+log akan memberi peringatan.
 
 Perilaku penting:
 
@@ -138,8 +158,8 @@ Perintah lain:
 
 ## Target 7 hari
 
-Satu putusan butuh 2 request (halaman detail + PDF), ditambah ±45 ribu request
-untuk halaman daftar. Pengaturan bawaan `REQ_PER_SEC=4` berarti ±2 putusan per
+Satu putusan butuh 2 request (halaman detail + PDF), ditambah ±47 ribu request
+untuk halaman daftar (±45 ribu halaman, plus halaman pertama tiap bagian). Pengaturan bawaan `REQ_PER_SEC=4` berarti ±2 putusan per
 detik atau ±170 ribu per hari. Dengan begitu, 900 ribu putusan selesai dalam
 **±5,5 hari**, dan masih ada cadangan ±1,5 hari untuk gangguan (Cloudflare,
 server MA lambat, listrik/internet mati).
@@ -196,7 +216,8 @@ Laporan Bot Putusan MA 2025 (26-10-2026 08:45)
 - Terunduh: 301,550 / ±900,000 (33.5%)
 - 24 jam terakhir: +171,230 | 1 jam terakhir: +7,180
 - Antre: 596,811 | Gagal: 38 | Tanpa PDF: 1,601
-- Crawl daftar: selesai (gagal: 0)
+- Crawl daftar: selesai, 1,204/1,204 bagian, 46,880 halaman (gagal: 0 bagian, 0 halaman)
+- Putusan terdaftar: 899,412 dari ±900,130 di situs
 - Ukuran: 144.3 GB (rata-rata 502.1 KB/file) | Sisa disk: 1.2 TB
 - Perkiraan selesai: ±3.5 hari
 - Target 7 hari: paling lambat 31-10-2026 02:49 (sisa 4.7 hari)
