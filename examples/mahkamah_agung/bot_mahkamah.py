@@ -25,6 +25,7 @@ Perintah:
   python bot_mahkamah.py report       tulis progres ke laporan.log (untuk cron)
   python bot_mahkamah.py export [f]   ekspor metadata ke CSV
   python bot_mahkamah.py retry-failed antrekan ulang putusan/halaman yang gagal
+  python bot_mahkamah.py check        uji awal ±1 menit (bypass, daftar, detail, 1 PDF)
 """
 import argparse
 import csv
@@ -38,6 +39,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import sys
 import threading
 import time
 from urllib.parse import urljoin, urlparse
@@ -876,6 +878,105 @@ def export_csv(db, path):
     print(f"{n:,} baris diekspor ke {path}")
 
 
+# ------------------------------------------------------------------ uji awal
+def check(http):
+    """Uji cepat sebelum bot dijalankan: bypass, daftar, pemecahan, detail, PDF.
+    Tidak mengubah database; contoh PDF disimpan ke DOWNLOAD_DIR/cek_contoh.pdf."""
+    results = []
+
+    def report(ok, name, message):
+        results.append(ok)
+        print(f"[{'OK' if ok else 'GAGAL'}] {name}: {message}", flush=True)
+        return ok
+
+    print(f"Uji awal: {BASE_URL}{ROOT_PATH}.html\n", flush=True)
+    # 1. server bypass (langsung, tanpa coba-ulang tanpa batas)
+    try:
+        r = requests.get(f"{BYPASS_URL}/cookies", params={"url": BASE_URL + "/"}, timeout=300)
+        r.raise_for_status()
+        data = r.json()
+        http.bypass.cookies, http.bypass.user_agent = data["cookies"], data["user_agent"]
+        http.bypass.generation = 1
+        names = ", ".join(sorted(data["cookies"])) or "-"
+        report("cf_clearance" in data["cookies"], "Server bypass",
+               f"cookie: {names}" + ("" if "cf_clearance" in data["cookies"]
+                                     else " (tidak ada cf_clearance; Cloudflare mungkin belum aktif atau gagal)"))
+    except Exception as e:
+        report(False, "Server bypass", f"{BYPASS_URL} tidak bisa dipakai: {e}. Sudah 'docker compose up -d'?")
+        return False
+
+    # 2. halaman daftar tahun ini + filter sidebar
+    try:
+        items, last, facets = parse_list(http.get(list_url(ROOT_PATH, 1)).text)
+        root = parse_filters(ROOT_PATH + ".html")
+        total = next((c for title, entries in facets.items() if title.startswith("tahun")
+                      for f, _, c in entries if f == root and c), None)
+        courts = [e for title, entries in facets.items() if title.startswith("pengadilan") for e in entries]
+        court_sum = sum(c or 0 for _, _, c in courts)
+        report(bool(items), "Halaman daftar",
+               f"{len(items)} putusan di halaman 1, halaman terakhir {last}, "
+               f"total menurut situs: {f'{total:,}' if total else 'tidak terbaca'}, "
+               f"{len(courts)} pengadilan di sidebar (jumlahnya {court_sum:,})")
+        if total and court_sum and court_sum != total:
+            print(f"        Catatan: jumlah per pengadilan ({court_sum:,}) != total ({total:,}); "
+                  "selisih kecil wajar, selisih besar berarti daftar pengadilan tidak lengkap.")
+        if not items:
+            return False
+    except Exception as e:
+        report(False, "Halaman daftar", str(e))
+        return False
+
+    # 3. pemecahan: buka bagian pengadilan terbesar
+    capped = last >= CAP_PAGES or bool(total and total > last * 20 + 20)
+    dimension, kids, _ = split_children(root, facets) if capped else (None, {}, False)
+    if not capped:
+        report(True, "Pemecahan daftar", "tidak perlu, daftar tidak terpotong")
+    elif not kids:
+        report(False, "Pemecahan daftar", "daftar terpotong tapi filter sidebar tidak ditemukan")
+    else:
+        path, (label, count) = max(kids.items(), key=lambda kv: kv[1][1] or 0)
+        try:
+            sub_items, sub_last, _ = parse_list(http.get(list_url(path, 1)).text)
+            report(bool(sub_items), "Pemecahan daftar",
+                   f"per {dimension}: {len(kids)} bagian; contoh '{label}' "
+                   f"({f'{count:,}' if count else '?'} putusan): {len(sub_items)} putusan di halaman 1, "
+                   f"halaman terakhir {sub_last}")
+        except Exception as e:
+            report(False, "Pemecahan daftar", f"{list_url(path, 1)}: {e}")
+
+    # 4 & 5. halaman detail + unduh satu PDF
+    for item in items[:5]:
+        try:
+            meta, pdf_url, nama_file = parse_detail(http.get(item["url"]).text)
+        except Exception as e:
+            report(False, "Halaman detail", f"{item['url']}: {e}")
+            break
+        if not meta:
+            report(False, "Halaman detail", f"tabel metadata tidak ditemukan di {item['url']}")
+            break
+        if not pdf_url:
+            continue  # putusan ini tidak punya PDF, coba berikutnya
+        report(True, "Halaman detail", f"Nomor {meta.get('Nomor', '?')}, {meta.get('Lembaga Peradilan', '?')}")
+        try:
+            r = http.get(pdf_url, referer=item["url"])
+            if b"%PDF" not in r.content[:1024]:
+                raise ParseError(f"bukan PDF (content-type={r.headers.get('content-type')})")
+            sample = os.path.join(DOWNLOAD_DIR, "cek_contoh.pdf")
+            with open(sample, "wb") as f:
+                f.write(r.content)
+            report(True, "Unduh PDF", f"{nama_file or 'PDF'} {human_bytes(len(r.content))} -> {sample}")
+        except Exception as e:
+            report(False, "Unduh PDF", f"{pdf_url}: {e}")
+        break
+    else:
+        report(False, "Halaman detail", "5 putusan pertama tidak punya link PDF")
+
+    ok = all(results)
+    print("\nSEMUA OK: bot siap dijalankan." if ok else
+          "\nADA YANG GAGAL: kirim seluruh output ini (dan bot.log) untuk diperbaiki.")
+    return ok
+
+
 # ----------------------------------------------------------------------- main
 def setup_logging():
     fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
@@ -893,7 +994,8 @@ def setup_logging():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Bot unduh putusan Mahkamah Agung")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "crawl", "download", "update", "stats", "report", "export", "retry-failed"])
+                        choices=["run", "crawl", "download", "update", "stats", "report", "export", "retry-failed",
+                                 "check"])
     parser.add_argument("output", nargs="?", help="file CSV untuk perintah export")
     args = parser.parse_args(argv)
 
@@ -927,6 +1029,13 @@ def main(argv=None):
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+
+    if args.command == "check":
+        try:
+            ok = check(Http(stop))
+        except Stopped:
+            ok = False
+        sys.exit(0 if ok else 1)
 
     def heartbeat():
         # tanda bot masih hidup (untuk status di laporan) + laporan berkala

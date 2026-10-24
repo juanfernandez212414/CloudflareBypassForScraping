@@ -23,6 +23,62 @@ memakai VPS untuk unduhan penuh, tambahkan block storage minimal ±1 TB dan isi
 kredit untuk minimal 7 hari. Bot otomatis menjeda unduhan saat sisa disk di bawah
 `MIN_FREE_GB`, jadi disk tidak akan penuh total.
 
+## Uji awal di komputer lokal
+
+Sebelum dijalankan penuh di server, uji dulu di komputer sendiri (Windows lewat
+WSL2, atau Linux). Gunakan **folder uji terpisah**: hitungan target 7 hari
+dimulai saat bot pertama kali jalan dengan suatu database, jadi database uji
+jangan dibawa ke server.
+
+**Windows:** pasang [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+dan aktifkan *Settings → Resources → WSL integration → Ubuntu*. Pasang Ubuntu
+dengan menjalankan `wsl --install -d Ubuntu` di PowerShell (Run as
+administrator), lalu restart. Semua perintah di bawah dijalankan di terminal
+**Ubuntu**, bukan PowerShell.
+
+**Linux:** cukup `sudo apt install -y docker.io docker-compose-v2`.
+
+```bash
+sudo apt update && sudo apt install -y python3-venv git
+git clone -b claude/gifted-brahmagupta-rdvo5t https://github.com/juanfernandez212414/CloudflareBypassForScraping.git
+cd CloudflareBypassForScraping/examples/mahkamah_agung
+
+docker compose up -d                  # unduhan image pertama kali butuh beberapa menit
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+
+# konfigurasi uji: folder terpisah, kecepatan rendah
+cat > .env <<ENV
+DOWNLOAD_DIR=$HOME/uji_ma
+WORKERS=2
+REQ_PER_SEC=1
+MIN_FREE_GB=1
+REPORT_EVERY_MIN=10
+ENV
+
+# 1) uji cepat ±1 menit: bypass, daftar 2025, pemecahan, detail, 1 PDF
+./venv/bin/python bot_mahkamah.py check
+
+# 2) bila semua OK: jalankan 15–30 menit, lalu hentikan dengan Ctrl+C
+./venv/bin/python bot_mahkamah.py
+./venv/bin/python bot_mahkamah.py stats
+```
+
+Contoh hasil `check` yang baik:
+
+```
+[OK] Server bypass: cookie: __cf_bm, cf_clearance
+[OK] Halaman daftar: 20 putusan di halaman 1, halaman terakhir 499, total menurut situs: 9xx,xxx, ... pengadilan di sidebar
+[OK] Pemecahan daftar: per pengadilan: ... bagian; contoh 'MAHKAMAH AGUNG' (...): 20 putusan di halaman 1, ...
+[OK] Halaman detail: Nomor ..., ...
+[OK] Unduh PDF: ....pdf 312.5 KB -> /home/USER/uji_ma/cek_contoh.pdf
+
+SEMUA OK: bot siap dijalankan.
+```
+
+Bila ada `[GAGAL]`, kirim seluruh output `check` beserta isi
+`~/uji_ma/bot.log`. Di Windows, file uji bisa dibuka lewat File Explorer
+di `\\wsl$\Ubuntu\home\<user>\uji_ma`.
+
 ## Cara kerja
 
 **Batas daftar ±10 ribu putusan.** Situs MA hanya menampilkan sekitar 500
@@ -132,6 +188,7 @@ Perintah lain:
 
 | Perintah | Fungsi |
 |---|---|
+| `python bot_mahkamah.py check` | Uji awal ±1 menit (bypass, daftar, pemecahan, detail, 1 PDF) |
 | `python bot_mahkamah.py stats` | Progres, kecepatan, perkiraan selesai, sisa disk |
 | `python bot_mahkamah.py report` | Tambahkan laporan progres ke `laporan.log` |
 | `python bot_mahkamah.py export hasil.csv` | Ekspor metadata (nomor, pengadilan, amar, lokasi file) ke CSV |

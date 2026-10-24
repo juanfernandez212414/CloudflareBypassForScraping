@@ -287,3 +287,21 @@ def test_migrates_old_database(stub, tmp_path):
     assert result.returncode == 0, result.stderr
     db = sqlite3.connect(tmp_path / "bot_state.db")
     assert db.execute("SELECT COUNT(*) FROM docs WHERE status='DONE'").fetchone()[0] == len(DOCS) - 2
+
+
+def test_check_command(stub, tmp_path):
+    result = run_bot(stub, tmp_path, "check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SEMUA OK" in result.stdout
+    assert "per pengadilan: 3 bagian" in result.stdout
+    assert (tmp_path / "cek_contoh.pdf").read_bytes().startswith(b"%PDF")
+    # uji awal tidak mengubah progres maupun memulai hitungan target 7 hari
+    db = sqlite3.connect(tmp_path / "bot_state.db")
+    assert db.execute("SELECT COUNT(*) FROM docs").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM kv WHERE k='started_at'").fetchone()[0] == 0
+
+
+def test_check_reports_bypass_down(tmp_path):
+    result = run_bot("http://127.0.0.1:9", tmp_path, "check")
+    assert result.returncode == 1
+    assert "[GAGAL] Server bypass" in result.stdout
