@@ -91,6 +91,7 @@ TARGET_DAYS = float(os.environ.get("TARGET_DAYS", "7"))   # target selesai sejak
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "5"))
 MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "2"))   # jeda unduh bila disk hampir penuh
 TIMEOUT = int(os.environ.get("TIMEOUT", "60"))
+BACKOFF = float(os.environ.get("BACKOFF_SECONDS", "30"))  # jeda dasar setelah HTTP 429/5xx
 REPORT_FILE = os.environ.get("REPORT_FILE", os.path.join(DOWNLOAD_DIR, "laporan.log"))
 REPORT_EVERY_MIN = int(os.environ.get("REPORT_EVERY_MIN", "60"))  # laporan otomatis selama bot jalan
 # Daftar dengan halaman terakhir >= angka ini dianggap terpotong oleh situs
@@ -211,20 +212,46 @@ class DB:
 
 # ---------------------------------------------------------------- HTTP client
 class RateLimiter:
-    """Batas request global (semua thread) supaya server MA tidak terbebani."""
+    """Batas request global (semua thread) yang menyesuaikan diri dengan situs.
+
+    REQ_PER_SEC adalah batas atas. Situs MA membatasi request per IP (HTTP 429)
+    dan melambat/timeout bila kewalahan; setiap tanda itu memotong kecepatan
+    jadi separuh, lalu kecepatan naik pelan-pelan (+15% tiap 2 menit lancar)."""
+
+    MIN_RATE, CUT_EVERY, RAISE_EVERY = 0.05, 30, 120
 
     def __init__(self, per_sec):
-        self.interval = 1.0 / per_sec if per_sec > 0 else 0
+        self.max_rate = self.rate = per_sec
         self.lock = threading.Lock()
         self.next_at = 0.0
+        self.changed_at = time.monotonic()
+        self.cut_at = float("-inf")
 
     def wait(self, stop):
         with self.lock:
             now = time.monotonic()
             at = max(now, self.next_at)
-            self.next_at = at + self.interval
+            self.next_at = at + (1.0 / self.rate if self.rate > 0 else 0)
         if stop.wait(max(0.0, at - time.monotonic())):
             raise Stopped()
+
+    def slow_down(self, reason, pause=0):
+        with self.lock:
+            now = time.monotonic()
+            # request yang sedang berjalan bisa gagal bersamaan: satu potongan per 30 dtk
+            if now - self.cut_at >= self.CUT_EVERY and self.rate > self.MIN_RATE:
+                self.rate = max(self.MIN_RATE, self.rate / 2)
+                self.changed_at = self.cut_at = now
+                log.warning("Situs membatasi/kewalahan (%s): kecepatan diturunkan ke %.2f req/dtk", reason, self.rate)
+            self.next_at = max(self.next_at, now + pause)
+
+    def speed_up(self):
+        with self.lock:
+            now = time.monotonic()
+            if self.rate < self.max_rate and now - self.changed_at >= self.RAISE_EVERY:
+                self.rate = min(self.max_rate, self.rate * 1.15)
+                self.changed_at = now
+                log.info("Situs lancar: kecepatan dinaikkan ke %.2f req/dtk", self.rate)
 
 
 class Bypass:
@@ -311,10 +338,11 @@ class Metrics:
 
     WINDOW = 600
 
-    def __init__(self):
+    def __init__(self, limiter=None):
         self.lock = threading.Lock()
         self.events = collections.deque()
         self.started = time.time()
+        self.limiter = limiter
 
     def add(self, url, seconds, outcome):
         kind = "pdf" if "/download_file/" in url else "detail" if "/direktori/putusan/" in url else "daftar"
@@ -340,6 +368,7 @@ class Metrics:
             "avg": sum(sec for _, sec in ok) / len(ok) if ok else None,
             "outcomes": dict(collections.Counter(e[3] for e in events if e[3] != "ok")),
             "rate_limit": REQ_PER_SEC, "concurrency": WORKERS + CRAWL_WORKERS,
+            "rate_now": self.limiter.rate if self.limiter else REQ_PER_SEC,
         }
 
 
@@ -349,7 +378,7 @@ class Http:
         self.bypass = Bypass(stop)
         self.limiter = RateLimiter(REQ_PER_SEC)
         self.breaker = Breaker(stop)
-        self.metrics = Metrics()
+        self.metrics = Metrics(self.limiter)
         self.local = threading.local()
 
     def _session(self):
@@ -382,29 +411,36 @@ class Http:
             except Exception as e:
                 self.metrics.add(url, time.monotonic() - started, "jaringan")
                 last_error = f"jaringan: {e}"
+                # timeout = server kewalahan: kurangi tekanan, bukan menambah
+                self.limiter.slow_down("timeout/jaringan")
             else:
                 elapsed = self.local.last_seconds = time.monotonic() - started
-                challenge = is_challenge(r)
                 code = r.status_code
+                # 429 = dibatasi (Cloudflare/rate limit), walau halamannya mirip challenge.
+                # Cookie baru tidak menolong; yang menolong hanya memperlambat.
+                challenge = code != 429 and is_challenge(r)
                 self.metrics.add(url, elapsed, "blokir" if challenge else "ok" if code < 400 else
                                  "5xx" if code >= 500 else str(code))
-                if challenge:
-                    last_error = f"diblokir Cloudflare (HTTP {r.status_code})"
-                    self.bypass.refresh(seen_generation=generation, force=True)
-                    continue
-                if r.status_code == 404:
-                    self.breaker.ok()
-                    raise ParseError("HTTP 404")
-                if r.status_code == 429 or r.status_code >= 500:
-                    last_error = f"HTTP {r.status_code}"
-                    retry_after = r.headers.get("retry-after", "") if r.status_code == 429 else ""
+                if code == 429 or (code >= 500 and not challenge):
+                    last_error = f"HTTP {code}" + (" (dibatasi situs)" if code == 429 else "")
+                    retry_after = r.headers.get("retry-after", "")
                     wait = min(int(retry_after), 600) if retry_after.isdigit() else 0
-                    if self.stop.wait(max(wait, 10 * (attempt + 1))):
+                    wait = max(wait, BACKOFF * (attempt + 1))
+                    self.limiter.slow_down(f"HTTP {code}", pause=wait)
+                    if self.stop.wait(wait):
                         raise Stopped()
                     continue
-                if r.status_code >= 400:
-                    raise ParseError(f"HTTP {r.status_code}")
+                if challenge:
+                    last_error = f"diblokir Cloudflare (HTTP {code})"
+                    self.bypass.refresh(seen_generation=generation, force=True)
+                    continue
+                if code == 404:
+                    self.breaker.ok()
+                    raise ParseError("HTTP 404")
+                if code >= 400:
+                    raise ParseError(f"HTTP {code}")
                 self.breaker.ok()
+                self.limiter.speed_up()
                 return r
             if self.stop.wait(5 * (attempt + 1)):
                 raise Stopped()
@@ -891,10 +927,13 @@ def target_lines(s):
     if s["hours_left"] <= 0:
         return [head + f" -> LEWAT TARGET, sisa {s['remaining']:,} putusan"]
     need = s["need_per_hour"]
+    m = s["http"] or {}
     if s["per_hour"] >= need:
         verdict = "AMAN"
+    elif m.get("rate_now", REQ_PER_SEC) < m.get("rate_limit", REQ_PER_SEC) * 0.99:
+        verdict = "TERTINGGAL: situs membatasi kecepatan dari IP ini (lihat baris Situs)"
     else:
-        verdict = "TERTINGGAL: naikkan REQ_PER_SEC/WORKERS atau cek jumlah Gagal"
+        verdict = "TERTINGGAL: lihat baris Situs/Saran"
     return [head + f" (sisa {format_duration(s['hours_left'])})",
             f"- Laju sekarang: {s['per_hour']:,.0f}/jam | Laju minimal: {need:,.0f}/jam -> {verdict}"]
 
@@ -907,12 +946,18 @@ def site_lines(s):
     names = {"daftar": "daftar", "detail": "detail", "pdf": "PDF"}
     latency = ", ".join(f"{names[k]} {v:.1f} dtk" for k, v in m["latency"].items()) or "-"
     issues = ", ".join(f"{k}: {v}" for k, v in sorted(m["outcomes"].items())) or "tidak ada"
-    lines = [f"- Situs (10 mnt): {m['per_sec']:.2f} req/dtk dari batas {m['rate_limit']:g} | respons: {latency}",
+    rate_now = m.get("rate_now", m["rate_limit"])
+    limited = rate_now < m["rate_limit"] * 0.99
+    lines = [f"- Situs (10 mnt): {m['per_sec']:.2f} req/dtk | batas otomatis {rate_now:.2f} "
+             f"(maks {m['rate_limit']:g}) | respons: {latency}",
              f"- Gangguan (10 mnt): {issues}"]
-    if m["avg"] and m["per_sec"] < 0.8 * m["rate_limit"]:
-        needed = math.ceil(m["rate_limit"] * m["avg"] * 1.2)
+    if limited:
+        lines.append("- Catatan: situs membatasi kecepatan (HTTP 429/timeout), bot otomatis memperlambat diri. "
+                     "Menaikkan REQ_PER_SEC/WORKERS tidak akan mempercepat.")
+    elif m["avg"] and m["per_sec"] < 0.8 * rate_now:
+        needed = math.ceil(rate_now * m["avg"] * 1.2)
         if needed > m["concurrency"]:
-            lines.append(f"- Saran: situs lambat (±{m['avg']:.0f} dtk/request); untuk {m['rate_limit']:g} req/dtk "
+            lines.append(f"- Saran: situs lambat (±{m['avg']:.0f} dtk/request); untuk {rate_now:g} req/dtk "
                          f"perlu ±{needed} koneksi bersamaan, sekarang {m['concurrency']}. "
                          f"Naikkan WORKERS di .env lalu restart.")
     return lines

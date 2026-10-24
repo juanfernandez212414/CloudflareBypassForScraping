@@ -118,7 +118,9 @@ class Stub(BaseHTTPRequestHandler):
     """Gabungan server bypass + situs MA. Cookie 'basi' ditolak (challenge);
     hanya cookie baru dari /html?bypassCookieCache=true yang diterima."""
 
-    state = {"fresh": False, "browser_runs": 0}
+    state = {"fresh": False, "browser_runs": 0, "rate_limited": 0}
+    RATE_LIMIT_PAGE = ('<html><head><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+                       '</head><body>Error 1015: You are being rate limited</body></html>')
 
     def log_message(self, *args):
         pass
@@ -154,6 +156,10 @@ class Stub(BaseHTTPRequestHandler):
             page = re.search(r"/page/(\d+)\.html$", path)
             return self.send(200, list_page(base, bot.parse_filters(path), int(page.group(1)) if page else 1))
         m = re.search(r"/direktori/putusan/(\w+)\.html$", path)
+        if m and self.state["rate_limited"] > 0:
+            # Cloudflare rate limit: 429 dengan halaman yang mirip challenge
+            self.state["rate_limited"] -= 1
+            return self.send(429, self.RATE_LIMIT_PAGE)
         if m:
             return self.send(200, detail_page(base, m.group(1), with_pdf=m.group(1) != NO_PDF_ID))
         m = re.search(r"/download_file/\w+/pdf/(\w+)$", path)
@@ -166,7 +172,7 @@ class Stub(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def stub():
-    Stub.state.update(fresh=False, browser_runs=0)
+    Stub.state.update(fresh=False, browser_runs=0, rate_limited=0)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}"
@@ -176,7 +182,8 @@ def stub():
 def run_bot(base, tmp_path, *args):
     env = dict(os.environ, MA_BASE_URL=base, BYPASS_URL=base, MA_YEAR="2025", MA_CAP_PAGES=str(CAP),
                DOWNLOAD_DIR=str(tmp_path), REQ_PER_SEC="100", WORKERS="3", CRAWL_WORKERS="3", MAX_ATTEMPTS="1",
-               MIN_FREE_GB="0", NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+               MIN_FREE_GB="0", BACKOFF_SECONDS="0.2",
+               NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
     return subprocess.run([sys.executable, os.path.join(HERE, "bot_mahkamah.py"), *args],
                           env=env, capture_output=True, text=True, timeout=120)
 
@@ -316,3 +323,17 @@ def test_check_reports_bypass_down(tmp_path):
     result = run_bot("http://127.0.0.1:9", tmp_path, "check")
     assert result.returncode == 1
     assert "[GAGAL] Server bypass" in result.stdout
+
+
+def test_rate_limit_slows_down_instead_of_new_clearance(stub, tmp_path):
+    Stub.state["rate_limited"] = 3
+    result = run_bot(stub, tmp_path)
+    assert result.returncode == 0, result.stderr
+    log_text = (tmp_path / "bot.log").read_text(encoding="utf-8")
+    assert "kecepatan diturunkan" in log_text
+    # 429 tidak boleh memicu pembuatan clearance baru (hanya cookie basi di awal)
+    assert Stub.state["browser_runs"] == 1
+    db = sqlite3.connect(tmp_path / "bot_state.db")
+    assert db.execute("SELECT COUNT(*) FROM docs WHERE status='DONE'").fetchone()[0] == len(DOCS) - 2
+    stats = run_bot(stub, tmp_path, "stats").stdout
+    assert "429: 3" in stats and "situs membatasi kecepatan" in stats

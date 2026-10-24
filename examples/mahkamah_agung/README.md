@@ -214,45 +214,47 @@ Perintah lain:
 | `BYPASS_URL` | `http://localhost:8000` | Alamat server bypass |
 | `SEL_LIST_ITEM`, `SEL_PDF` | lihat skrip | Selector CSS; ubah hanya bila struktur situs berubah |
 
-## Target 7 hari
+## Target 7 hari dan batas kecepatan situs
 
-Tahun 2025 berisi **977.993 putusan** (angka dari situs saat uji awal). Satu
-putusan butuh 2 request (halaman detail + PDF), ditambah ±50 ribu request
-untuk halaman daftar. Pada `REQ_PER_SEC=4` (±2 putusan/detik, ±170 ribu per
-hari), unduhan selesai dalam **±5,8 hari**, dengan cadangan ±1 hari untuk
-gangguan.
+Tahun 2025 berisi **977.993 putusan**, atau sekitar 2 juta request (halaman
+detail + PDF, ditambah ±50 ribu halaman daftar). Supaya selesai dalam 7 hari,
+dibutuhkan rata-rata **±3,4 request/detik** tanpa henti.
 
-Bagian Target di laporan menunjukkan apakah jadwal tercapai:
+**Hasil uji lokal (24-10-2026):**
 
-- **AMAN**: laju 1 jam terakhir sudah cukup untuk selesai sebelum tenggat.
-- **TERTINGGAL**: lihat dulu baris **Situs** dan **Saran** di laporan (lihat
-  di bawah). Bila laju `req/dtk` jauh di bawah batasnya, naikkan `WORKERS`
-  sesuai saran. Bila laju sudah mendekati batasnya, naikkan `REQ_PER_SEC`
-  (mis. ke 5). Setelah mengubah `.env`, jalankan
-  `sudo systemctl restart bot-mahkamah`. Sebelum itu, cek dulu
-  apakah jumlah `Gagal` melonjak atau log berisi `kegagalan beruntun`. Kalau
-  ya, masalahnya pemblokiran, bukan kecepatan, dan menaikkan kecepatan justru
-  memperparah.
+- Pada ±0,15 request/detik (3 koneksi): lancar, tanpa error, tetapi situs
+  merespons ±20 detik per request.
+- Pada 8 koneksi bersamaan: dalam beberapa menit Cloudflare membalas
+  **HTTP 429 ("terlalu banyak request")** dan server MA mulai **timeout 60
+  detik**.
 
-**Situs MA lambat.** Pada uji awal, satu request rata-rata butuh ±20 detik.
-Karena itu `REQ_PER_SEC` hanya tercapai bila cukup banyak koneksi berjalan
-bersamaan, kira-kira `REQ_PER_SEC × detik per request`. Laporan menampilkan
-angkanya:
+Artinya situs MA membatasi kecepatan per IP dan memang sedang kewalahan.
+Karena itu bot sekarang **menyesuaikan kecepatannya sendiri**:
+
+- Setiap 429, 5xx, atau timeout memotong kecepatan menjadi separuh dan
+  menjeda semua koneksi sebentar.
+- Setelah 2 menit lancar, kecepatan naik 15%, sampai batas `REQ_PER_SEC`.
+
+Kecepatan yang benar-benar diizinkan situs terlihat di laporan:
 
 ```
-- Situs (10 mnt): 3.85 req/dtk dari batas 4 | respons: daftar 18.2 dtk, detail 4.1 dtk, PDF 2.3 dtk
-- Gangguan (10 mnt): tidak ada
-- Saran: situs lambat (±9 dtk/request); untuk 4 req/dtk perlu ±44 koneksi bersamaan, sekarang 30. ...
+- Situs (10 mnt): 0.48 req/dtk | batas otomatis 0.50 (maks 4) | respons: daftar 18.2 dtk, detail 6.1 dtk, PDF 3.3 dtk
+- Gangguan (10 mnt): 429: 2, jaringan: 1
+- Catatan: situs membatasi kecepatan (HTTP 429/timeout), bot otomatis memperlambat diri. ...
 ```
 
-Perintah `check` juga mengukur hal ini (langkah **Uji paralel**) sebelum bot
-dijalankan. Di baris **Gangguan**, `blokir` berarti Cloudflare menolak dan
-`429`/`5xx` berarti server MA kewalahan. Bila angka-angka ini naik setelah
-`WORKERS` dinaikkan, turunkan lagi: pemblokiran tidak bisa diatasi dengan
-menambah kecepatan.
+Perkiraan lama pengerjaan berdasarkan kecepatan itu: ±2 juta request ÷
+(req/dtk × 86.400) hari. Contohnya, 0,5 req/dtk ≈ 47 hari, 1 req/dtk ≈ 23 hari,
+dan 3,4 req/dtk ≈ 7 hari. Bila situs hanya mengizinkan jauh di bawah 3,4
+req/dtk, target 7 hari tidak tercapai dari satu IP. Menaikkan `REQ_PER_SEC`
+atau `WORKERS` tidak membantu, karena bot tetap akan diperlambat oleh 429.
 
-Komputer, Docker, dan bot harus menyala terus selama 7 hari. Gunakan service
-systemd di atas supaya bot otomatis jalan lagi setelah reboot.
+Bagian **Target** di laporan menulis `AMAN` atau `TERTINGGAL`. Bila
+`TERTINGGAL`, laporan juga menyebutkan apakah penyebabnya pembatasan oleh
+situs.
+
+Komputer, Docker, dan bot harus menyala terus. Gunakan service systemd di atas
+supaya bot otomatis jalan lagi setelah reboot.
 
 ## Laporan ke file log
 
