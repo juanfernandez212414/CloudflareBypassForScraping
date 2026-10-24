@@ -173,6 +173,13 @@ def test_end_to_end(stub, tmp_path):
     stats = run_bot(stub, tmp_path, "stats").stdout
     assert f"Terunduh: {PAGES * PER_PAGE - 2} / ±{PAGES * PER_PAGE}" in stats
     assert "Server bypass: OK" in stats
+    assert "Target 7 hari: paling lambat" in stats
+
+    # laporan ditulis ke file (laporan akhir tiap run + perintah report)
+    report = tmp_path / "laporan.log"
+    before = report.read_text(encoding="utf-8").count("Laporan Bot Putusan MA")
+    assert run_bot(stub, tmp_path, "report").returncode == 0
+    assert report.read_text(encoding="utf-8").count("Laporan Bot Putusan MA") == before + 1
 
     out = tmp_path / "meta.csv"
     assert run_bot(stub, tmp_path, "export", str(out)).returncode == 0

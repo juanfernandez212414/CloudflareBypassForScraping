@@ -12,7 +12,7 @@ kapan saja tanpa mengulang dari awal.
 | | VPS (2 vCPU / 2 GB / 20 GB) | Lokal (disk 1,5 TB) |
 |---|---|---|
 | Ruang disk | **20 GB, jauh tidak cukup.** 900 rb PDF diperkirakan butuh ratusan GB | Cukup |
-| Durasi | ±10–11 hari nonstop; kredit Rp 31 rb (tarif Rp 149 rb/bulan) hanya cukup ±6 hari | Gratis, selama komputer menyala |
+| Durasi | Target 7 hari nonstop; kredit Rp 31 rb (tarif Rp 149 rb/bulan) hanya cukup ±6 hari | Gratis, selama komputer menyala 7 hari penuh |
 | RAM | 2 GB cukup asal pakai `docker-compose.yml` di folder ini + swap | Biasanya lebih longgar |
 | IP | IP datacenter lebih sering kena challenge Cloudflare | IP rumahan biasanya lebih lancar |
 
@@ -20,7 +20,7 @@ VPS tetap berguna untuk **uji coba singkat**: jalankan beberapa jam, lalu cek
 `python bot_mahkamah.py stats` untuk melihat ukuran rata-rata per file dan
 kecepatan nyata. Dari situ kebutuhan disk total bisa dihitung. Kalau tetap ingin
 memakai VPS untuk unduhan penuh, tambahkan block storage minimal ±1 TB dan isi
-kredit untuk ±2 minggu. Bot otomatis menjeda unduhan saat sisa disk di bawah
+kredit untuk minimal 7 hari. Bot otomatis menjeda unduhan saat sisa disk di bawah
 `MIN_FREE_GB`, jadi disk tidak akan penuh total.
 
 ## Cara kerja
@@ -71,7 +71,7 @@ python3 -m venv venv
 
 # 5. Konfigurasi
 cp .env.example .env && chmod 600 .env
-nano .env                               # isi DOWNLOAD_DIR, token Telegram, dll.
+nano .env                               # isi DOWNLOAD_DIR, dll.
 ```
 
 **Khusus VPS 2 GB:** tambahkan swap supaya browser tidak kehabisan RAM.
@@ -113,7 +113,7 @@ Perintah lain:
 | Perintah | Fungsi |
 |---|---|
 | `python bot_mahkamah.py stats` | Progres, kecepatan, perkiraan selesai, sisa disk |
-| `python bot_mahkamah.py report` | Kirim progres ke Telegram |
+| `python bot_mahkamah.py report` | Tambahkan laporan progres ke `laporan.log` |
 | `python bot_mahkamah.py export hasil.csv` | Ekspor metadata (nomor, pengadilan, amar, lokasi file) ke CSV |
 | `python bot_mahkamah.py retry-failed` | Antrekan ulang putusan/halaman yang gagal |
 | `python bot_mahkamah.py update` | Ambil putusan yang baru diunggah (daftar diurutkan dari unggahan terbaru) |
@@ -126,43 +126,81 @@ Perintah lain:
 | `MA_YEAR` | `2025` | Tahun putusan |
 | `DOWNLOAD_DIR` | `/mnt/data_1_5TB/putusan_<tahun>` | Folder PDF, log, dan (default) database |
 | `DB_NAME` | `<DOWNLOAD_DIR>/bot_state.db` | Database progres |
-| `WORKERS` | `3` | Unduhan paralel |
-| `REQ_PER_SEC` | `2` | Batas total request per detik ke situs MA |
+| `WORKERS` | `8` | Unduhan paralel |
+| `REQ_PER_SEC` | `4` | Batas total request per detik ke situs MA |
+| `TARGET_DAYS` | `7` | Target selesai, dihitung sejak bot pertama kali jalan |
+| `REPORT_FILE` | `<DOWNLOAD_DIR>/laporan.log` | File laporan progres |
+| `REPORT_EVERY_MIN` | `60` | Selama bot jalan, laporan ditulis tiap N menit (0 = mati) |
 | `MAX_ATTEMPTS` | `5` | Percobaan sebelum ditandai `FAILED` |
 | `MIN_FREE_GB` | `2` | Unduhan dijeda bila sisa disk di bawah ini |
 | `BYPASS_URL` | `http://localhost:8000` | Alamat server bypass |
 | `SEL_LIST_ITEM`, `SEL_PDF` | lihat skrip | Selector CSS; ubah hanya bila struktur situs berubah |
 
-**Perkiraan waktu:** satu putusan butuh 2 request (halaman detail + PDF). Pada
-2 req/detik, kecepatannya ±1 putusan/detik atau ±86 ribu per hari, jadi 900
-ribu putusan selesai dalam ±10–11 hari. Menaikkan `REQ_PER_SEC` mempercepat,
-tetapi menambah beban server MA dan risiko IP diblokir. Naikkan bertahap
-sambil memantau jumlah `Gagal`.
+## Target 7 hari
 
-## Laporan harian Telegram (sebelum 09:00 WIB)
+Satu putusan butuh 2 request (halaman detail + PDF), ditambah ±45 ribu request
+untuk halaman daftar. Pengaturan bawaan `REQ_PER_SEC=4` berarti ±2 putusan per
+detik atau ±170 ribu per hari. Dengan begitu, 900 ribu putusan selesai dalam
+**±5,5 hari**, dan masih ada cadangan ±1,5 hari untuk gangguan (Cloudflare,
+server MA lambat, listrik/internet mati).
 
-1. Buat bot lewat @BotFather. Isi `TELEGRAM_BOT_TOKEN` dan `TELEGRAM_CHAT_ID`
-   di `.env`, lalu tes dengan `./venv/bin/python bot_mahkamah.py report`.
-2. Pastikan jam server memakai WIB. Cron Ubuntu mengikuti zona waktu sistem,
-   dan VPS sering diset ke UTC:
+Bagian Target di laporan menunjukkan apakah jadwal tercapai:
+
+- **AMAN**: laju 1 jam terakhir sudah cukup untuk selesai sebelum tenggat.
+- **TERTINGGAL**: naikkan `REQ_PER_SEC` (mis. ke 5) dan `WORKERS` (mis. ke 10)
+  di `.env`, lalu `sudo systemctl restart bot-mahkamah`. Sebelum itu, cek dulu
+  apakah jumlah `Gagal` melonjak atau log berisi `kegagalan beruntun`. Kalau
+  ya, masalahnya pemblokiran, bukan kecepatan, dan menaikkan kecepatan justru
+  memperparah.
+
+Kecepatan nyata juga dibatasi oleh seberapa cepat server MA merespons. Jika
+server butuh rata-rata lebih dari ±2 detik per request, 8 worker tidak cukup
+untuk mencapai 4 req/detik, dan hal itu akan terlihat sebagai laju di bawah
+target. Karena itu, cek laporan pada jam-jam pertama.
+
+Komputer, Docker, dan bot harus menyala terus selama 7 hari. Gunakan service
+systemd di atas supaya bot otomatis jalan lagi setelah reboot.
+
+## Laporan ke file log
+
+Tidak perlu Telegram. Laporan ditambahkan ke `DOWNLOAD_DIR/laporan.log`:
+
+- otomatis setiap 60 menit selama bot berjalan,
+- saat bot berhenti (laporan akhir),
+- setiap kali `python bot_mahkamah.py report` dijalankan.
+
+Untuk laporan harian sebelum 09:00 WIB, jadwalkan perintah `report` lewat cron.
+Laporan ini tetap tertulis walaupun bot sedang mati, dan akan berstatus
+`BERHENTI sejak ...`.
+
+1. Pastikan jam server memakai WIB. Cron Ubuntu mengikuti zona waktu sistem:
    ```bash
    sudo timedatectl set-timezone Asia/Jakarta && sudo systemctl restart cron
    ```
-3. Buka `crontab -e`, lalu tambahkan (ganti path-nya):
+2. Buka `crontab -e`, lalu tambahkan (ganti path-nya):
    ```
-   45 8 * * * cd /path/ke/examples/mahkamah_agung && ./venv/bin/python bot_mahkamah.py report >> report.log 2>&1
+   45 8 * * * cd /path/ke/examples/mahkamah_agung && ./venv/bin/python bot_mahkamah.py report > /dev/null 2>&1
    ```
+
+Melihat laporan:
+
+```bash
+tail -n 12 /mnt/data_1_5TB/putusan_2025/laporan.log    # laporan terakhir
+./venv/bin/python bot_mahkamah.py stats               # kondisi saat ini, tanpa menulis ke file
+```
 
 Contoh isi laporan:
 
 ```
-Laporan Bot Putusan MA 2025 (25-10-2026 08:45)
-- Terunduh: 86,120 / ±900,000 (9.6%)
-- 24 jam terakhir: +85,904 | 1 jam terakhir: +3,571
-- Antre: 812,447 | Gagal: 12 | Tanpa PDF: 1,421
+Laporan Bot Putusan MA 2025 (26-10-2026 08:45)
+- Terunduh: 301,550 / ±900,000 (33.5%)
+- 24 jam terakhir: +171,230 | 1 jam terakhir: +7,180
+- Antre: 596,811 | Gagal: 38 | Tanpa PDF: 1,601
 - Crawl daftar: selesai (gagal: 0)
-- Ukuran: 41.2 GB (rata-rata 502.1 KB/file) | Sisa disk: 1.3 TB
-- Perkiraan selesai: ±9.5 hari
+- Ukuran: 144.3 GB (rata-rata 502.1 KB/file) | Sisa disk: 1.2 TB
+- Perkiraan selesai: ±3.5 hari
+- Target 7 hari: paling lambat 31-10-2026 02:49 (sisa 4.7 hari)
+- Laju sekarang: 7,180/jam | Laju minimal: 5,300/jam -> AMAN
 - Bot: BERJALAN | Server bypass: OK
 ```
 

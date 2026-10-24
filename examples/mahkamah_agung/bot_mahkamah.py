@@ -17,7 +17,7 @@ Perintah:
   python bot_mahkamah.py download     hanya unduh yang sudah terdaftar
   python bot_mahkamah.py update       cek putusan yang baru diunggah (halaman awal)
   python bot_mahkamah.py stats        tampilkan progres
-  python bot_mahkamah.py report       kirim progres ke Telegram
+  python bot_mahkamah.py report       tulis progres ke laporan.log (untuk cron)
   python bot_mahkamah.py export [f]   ekspor metadata ke CSV
   python bot_mahkamah.py retry-failed antrekan ulang putusan/halaman yang gagal
 """
@@ -33,7 +33,6 @@ import re
 import shutil
 import signal
 import sqlite3
-import sys
 import threading
 import time
 from urllib.parse import urljoin
@@ -71,13 +70,16 @@ LIST_PATH = os.environ.get("MA_LIST_PATH", "/direktori/index/tahunjenis/putus/ta
 BYPASS_URL = os.environ.get("BYPASS_URL", "http://localhost:8000").rstrip("/")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", f"/mnt/data_1_5TB/putusan_{YEAR}")
 DB_NAME = os.environ.get("DB_NAME", os.path.join(DOWNLOAD_DIR, "bot_state.db"))
-WORKERS = int(os.environ.get("WORKERS", "3"))             # unduhan paralel
-REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "2"))    # batas total request ke situs MA
+# Tiap putusan = 2 request (halaman detail + PDF). 4 req/detik ~ 2 putusan/detik
+# ~ 170 rb/hari, jadi 900 rb putusan selesai ±5,5 hari (sisa waktu untuk gangguan).
+WORKERS = int(os.environ.get("WORKERS", "8"))             # unduhan paralel
+REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "4"))    # batas total request ke situs MA
+TARGET_DAYS = float(os.environ.get("TARGET_DAYS", "7"))   # target selesai sejak bot pertama jalan
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "5"))
 MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "2"))   # jeda unduh bila disk hampir penuh
 TIMEOUT = int(os.environ.get("TIMEOUT", "60"))
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+REPORT_FILE = os.environ.get("REPORT_FILE", os.path.join(DOWNLOAD_DIR, "laporan.log"))
+REPORT_EVERY_MIN = int(os.environ.get("REPORT_EVERY_MIN", "60"))  # laporan otomatis selama bot jalan
 
 # Struktur HTML (diverifikasi pada halaman asli situs MA). Halaman daftar punya
 # tiga tab: #tabs-1 "Putusan" (daftar sebenarnya, 20/halaman), #tabs-2 "Penting"
@@ -576,15 +578,44 @@ def collect_stats(db):
         "last_page": last_page,
         "crawl_finished": db.get_kv("crawl_finished"),
         "heartbeat": float(db.get_kv("heartbeat", 0)),
+        "stopped_at": float(db.get_kv("stopped_at", 0)),
         "disk_free": shutil.disk_usage(DOWNLOAD_DIR).free,
     }
     # perkiraan total: dari crawl bila sudah selesai, kalau belum dari jumlah halaman
     s["estimate"] = s["total"] if s["crawl_finished"] else max(s["total"], last_page * 20)
     remaining = s["estimate"] - s["done"] - s["no_pdf"] - s["failed"]
     # pakai laju 1 jam terakhir (paling mutakhir), atau rata-rata 24 jam
-    per_hour = s["last_hour"] or s["last_day"] / 24
-    s["eta_hours"] = remaining / per_hour if per_hour else None
+    s["per_hour"] = s["last_hour"] or s["last_day"] / 24
+    s["eta_hours"] = remaining / s["per_hour"] if s["per_hour"] else None
+    started = float(db.get_kv("started_at", 0))
+    s["deadline"] = started + TARGET_DAYS * 86400 if started else None
+    hours_left = (s["deadline"] - time.time()) / 3600 if started else None
+    s["hours_left"] = hours_left
+    s["need_per_hour"] = remaining / hours_left if hours_left and hours_left > 0 else None
+    s["remaining"] = remaining
     return s
+
+
+def format_duration(hours):
+    return f"{hours:.0f} jam" if hours < 48 else f"{hours / 24:.1f} hari"
+
+
+def target_lines(s):
+    if not s["deadline"]:
+        return []
+    deadline = time.strftime("%d-%m-%Y %H:%M", time.localtime(s["deadline"]))
+    head = f"- Target {TARGET_DAYS:g} hari: paling lambat {deadline}"
+    if s["remaining"] <= 0:
+        return [head + " -> SELESAI"]
+    if s["hours_left"] <= 0:
+        return [head + f" -> LEWAT TARGET, sisa {s['remaining']:,} putusan"]
+    need = s["need_per_hour"]
+    if s["per_hour"] >= need:
+        verdict = "AMAN"
+    else:
+        verdict = "TERTINGGAL: naikkan REQ_PER_SEC/WORKERS atau cek jumlah Gagal"
+    return [head + f" (sisa {format_duration(s['hours_left'])})",
+            f"- Laju sekarang: {s['per_hour']:,.0f}/jam | Laju minimal: {need:,.0f}/jam -> {verdict}"]
 
 
 def human_bytes(n):
@@ -595,10 +626,11 @@ def human_bytes(n):
 
 
 def format_stats(s):
-    if s["heartbeat"] and time.time() - s["heartbeat"] < 180:
+    if s["heartbeat"] and time.time() - s["heartbeat"] < 180 and s["stopped_at"] < s["heartbeat"]:
         bot = "BERJALAN"
     elif s["heartbeat"]:
-        bot = "BERHENTI sejak " + time.strftime("%d-%m %H:%M", time.localtime(s["heartbeat"]))
+        since = max(s["heartbeat"], s["stopped_at"])
+        bot = "BERHENTI sejak " + time.strftime("%d-%m %H:%M", time.localtime(since))
     else:
         bot = "belum pernah jalan"
     try:
@@ -608,12 +640,10 @@ def format_stats(s):
         bypass = "MATI"
     pct = 100 * s["done"] / s["estimate"] if s["estimate"] else 0
     crawl = "selesai" if s["crawl_finished"] else f"{s['pages_done']}/{s['last_page'] or '?'} halaman"
-    if s["eta_hours"] is None:
-        eta = "-"
-    elif s["eta_hours"] < 48:
-        eta = f"±{s['eta_hours']:.0f} jam"
+    if s["remaining"] <= 0:
+        eta = "sudah selesai"
     else:
-        eta = f"±{s['eta_hours'] / 24:.1f} hari"
+        eta = "-" if s["eta_hours"] is None else "±" + format_duration(s["eta_hours"])
     avg = human_bytes(s["bytes"] / s["done"]) if s["done"] else "-"
     return "\n".join([
         f"Laporan Bot Putusan MA {YEAR} ({time.strftime('%d-%m-%Y %H:%M')})",
@@ -623,26 +653,17 @@ def format_stats(s):
         f"- Crawl daftar: {crawl} (gagal: {s['pages_failed']})",
         f"- Ukuran: {human_bytes(s['bytes'])} (rata-rata {avg}/file) | Sisa disk: {human_bytes(s['disk_free'])}",
         f"- Perkiraan selesai: {eta}",
+        *target_lines(s),
         f"- Bot: {bot} | Server bypass: {bypass}",
     ])
 
 
-def send_report(db):
+def write_report(db):
+    """Tambahkan laporan progres ke REPORT_FILE dan kembalikan teksnya."""
     text = format_stats(collect_stats(db))
-    print(text)
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        sys.exit("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum di-set (lihat .env.example)")
-    for attempt in range(3):
-        try:
-            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                              json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
-            if r.ok:
-                return
-            error = r.text
-        except requests.RequestException as e:
-            error = str(e)
-        time.sleep(10 * (attempt + 1))
-    sys.exit(f"Gagal mengirim laporan Telegram: {error}")
+    with open(REPORT_FILE, "a", encoding="utf-8") as f:
+        f.write(text + "\n\n")
+    return text
 
 
 def export_csv(db, path):
@@ -685,7 +706,7 @@ def main(argv=None):
     if args.command == "stats":
         return print(format_stats(collect_stats(db)))
     if args.command == "report":
-        return send_report(db)
+        return print(write_report(db))
     if args.command == "export":
         return export_csv(db, args.output or os.path.join(DOWNLOAD_DIR, "metadata.csv"))
     if args.command == "retry-failed":
@@ -708,10 +729,20 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, on_signal)
 
     def heartbeat():
+        # tanda bot masih hidup (untuk status di laporan) + laporan berkala
+        minutes = 0
         while not stop.wait(60):
             db.set_kv("heartbeat", time.time())
+            minutes += 1
+            if REPORT_EVERY_MIN > 0 and minutes % REPORT_EVERY_MIN == 0:
+                try:
+                    log.info("Laporan:\n%s", write_report(db))
+                except Exception:
+                    log.exception("Gagal menulis laporan")
 
     db.set_kv("heartbeat", time.time())
+    if db.get_kv("started_at") is None:
+        db.set_kv("started_at", time.time())
     threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
 
     log.info("Mulai '%s': tahun %s, %d worker, %.1f req/detik, simpan ke %s (%s)",
@@ -753,7 +784,8 @@ def main(argv=None):
         pass
     finally:
         stop.set()
-        log.info("\n%s", format_stats(collect_stats(db)))
+        db.set_kv("stopped_at", time.time())
+        log.info("Laporan akhir:\n%s", write_report(db))
 
 
 if __name__ == "__main__":
