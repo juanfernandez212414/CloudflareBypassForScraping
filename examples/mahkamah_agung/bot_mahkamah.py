@@ -1,29 +1,41 @@
 """
 Bot unduh PDF putusan Mahkamah Agung (putusan3.mahkamahagung.go.id) skala besar.
 
-Alur kerja dua fase, semuanya tercatat di SQLite sehingga bisa dilanjutkan:
-  1. crawl   : telusuri halaman daftar -> simpan URL detail putusan ke tabel `docs`
-  2. download: untuk tiap putusan PENDING -> buka halaman detail -> unduh PDF
+Cara kerja:
+  - crawl    : telusuri halaman daftar per tahun -> simpan putusan ke SQLite
+  - download : buka halaman detail tiap putusan -> simpan metadata + unduh PDF
+  Perintah `run` (bawaan) menjalankan keduanya bersamaan. Semua progres ada di
+  SQLite, jadi bot bisa dihentikan/di-restart kapan saja dan lanjut sendiri.
 
 Clearance Cloudflare diambil dari server bypass lokal (endpoint /cookies).
-cf_clearance terikat ke IP + User-Agent (+ sidik jari TLS), jadi bot ini HARUS
-berjalan di mesin/IP yang sama dengan container bypass.
+cf_clearance terikat ke IP + User-Agent, jadi bot HARUS berjalan di mesin/IP
+yang sama dengan container bypass.
 
-Pemakaian:
-  python bot_mahkamah.py            # crawl lalu download
-  python bot_mahkamah.py crawl
-  python bot_mahkamah.py download
-  python bot_mahkamah.py stats
+Perintah:
+  python bot_mahkamah.py [run]        crawl + download bersamaan
+  python bot_mahkamah.py crawl        hanya kumpulkan daftar putusan
+  python bot_mahkamah.py download     hanya unduh yang sudah terdaftar
+  python bot_mahkamah.py update       cek putusan yang baru diunggah (halaman awal)
+  python bot_mahkamah.py stats        tampilkan progres
+  python bot_mahkamah.py report       kirim progres ke Telegram
+  python bot_mahkamah.py export [f]   ekspor metadata ke CSV
+  python bot_mahkamah.py retry-failed antrekan ulang putusan/halaman yang gagal
 """
-import os
-import re
-import sys
-import time
-import random
-import sqlite3
+import argparse
+import csv
+import hashlib
+import json
 import logging
+import logging.handlers
+import os
+import queue
+import re
+import shutil
+import signal
+import sqlite3
+import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from urllib.parse import urljoin
 
 import requests
@@ -32,243 +44,716 @@ from bs4 import BeautifulSoup
 try:
     # curl_cffi meniru sidik jari TLS Chrome; requests biasa sering tetap kena
     # challenge walau cookie cf_clearance sudah benar.
-    from curl_cffi import requests as http
-    IMPERSONATE = {"impersonate": "chrome"}
+    from curl_cffi import requests as cffi
 except ImportError:  # pragma: no cover
-    http = requests
-    IMPERSONATE = {}
+    cffi = None
+
+
+def load_env_file(path):
+    """Baca KEY=VALUE dari .env tanpa menimpa variabel yang sudah di-set."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    except FileNotFoundError:
+        pass
+
+
+load_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ---------------------------------------------------------------- konfigurasi
-BASE_URL = os.environ.get("MA_BASE_URL", "https://putusan3.mahkamahagung.go.id")
+BASE_URL = os.environ.get("MA_BASE_URL", "https://putusan3.mahkamahagung.go.id").rstrip("/")
 YEAR = os.environ.get("MA_YEAR", "2025")
-LIST_URL = BASE_URL + "/direktori/index/tahunjenis/putus/tahun/{year}/page/{page}.html"
-BYPASS_URL = os.environ.get("BYPASS_URL", "http://localhost:8000")
+LIST_PATH = os.environ.get("MA_LIST_PATH", "/direktori/index/tahunjenis/putus/tahun/{year}").format(year=YEAR)
+BYPASS_URL = os.environ.get("BYPASS_URL", "http://localhost:8000").rstrip("/")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", f"/mnt/data_1_5TB/putusan_{YEAR}")
 DB_NAME = os.environ.get("DB_NAME", os.path.join(DOWNLOAD_DIR, "bot_state.db"))
-WORKERS = int(os.environ.get("WORKERS", "2"))          # jangan terlalu tinggi
-DELAY = float(os.environ.get("DELAY", "1.0"))          # jeda per request per worker
+WORKERS = int(os.environ.get("WORKERS", "3"))             # unduhan paralel
+REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "2"))    # batas total request ke situs MA
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "5"))
-TIMEOUT = 60
+MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "2"))   # jeda unduh bila disk hampir penuh
+TIMEOUT = int(os.environ.get("TIMEOUT", "60"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Selector bisa diubah lewat env tanpa edit kode. Bila selector tidak cocok,
-# bot jatuh ke pola regex pada href (lihat find_detail_links / find_pdf_link).
-SEL_DETAIL = os.environ.get("SEL_DETAIL", "div.spost strong a")
-SEL_PDF = os.environ.get("SEL_PDF", "a[href*='download_file'][href*='/pdf/']")
-RE_DETAIL = re.compile(r"/direktori/putusan/([0-9a-f]+)\.html")
-RE_PDF = re.compile(r"/direktori/download_file/[0-9a-f]+/pdf/")
+# Struktur HTML (diverifikasi pada halaman asli situs MA). Halaman daftar punya
+# tiga tab: #tabs-1 "Putusan" (daftar sebenarnya, 20/halaman), #tabs-2 "Penting"
+# dan #tabs-3 "Terpopuler" yang isinya sama di setiap halaman -> harus diabaikan.
+SEL_LIST_ITEM = os.environ.get("SEL_LIST_ITEM", "#tabs-1 div.spost")
+SEL_PDF = os.environ.get("SEL_PDF", "a[href*='/direktori/download_file/'][href*='/pdf/']")
+RE_DETAIL = re.compile(r"/direktori/putusan/([A-Za-z0-9]+)\.html")
+RE_LIST_DATE = re.compile(r"(Register|Putus|Upload)\s*:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})")
+CHALLENGE_MARKERS = ("Just a moment", "cf-chl", "challenge-platform", "cf-browser-verification",
+                     "Attention Required", "Sorry, you have been blocked")
 
-CHALLENGE_MARKERS = ("Just a moment", "cf-chl", "challenge-platform", "Attention Required")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot_ma")
 
 
+class Stopped(Exception):
+    """Bot diminta berhenti (Ctrl+C / SIGTERM)."""
+
+
+class TransientError(Exception):
+    """Gangguan jaringan/server, bukan kesalahan dokumen."""
+
+
+class ParseError(Exception):
+    """Halaman terunduh tapi isinya tidak seperti yang diharapkan."""
+
+
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ------------------------------------------------------------------- database
-def db_connect():
-    conn = sqlite3.connect(DB_NAME, timeout=60, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS pages (
-            page INTEGER PRIMARY KEY, status TEXT, n_links INTEGER, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS docs (
-            id TEXT PRIMARY KEY, url TEXT, status TEXT DEFAULT 'PENDING',
-            attempts INTEGER DEFAULT 0, file TEXT, size INTEGER, error TEXT,
-            updated_at TEXT);
-        CREATE INDEX IF NOT EXISTS docs_status ON docs(status);
-    """)
-    return conn
+class DB:
+    DOC_COLUMNS = {
+        "url": "TEXT", "judul": "TEXT", "tgl_register": "TEXT", "tgl_putus": "TEXT",
+        "tgl_upload": "TEXT", "status": "TEXT DEFAULT 'PENDING'", "attempts": "INTEGER DEFAULT 0",
+        "next_try": "REAL DEFAULT 0", "nomor": "TEXT", "pdf_url": "TEXT", "nama_file": "TEXT",
+        "file": "TEXT", "size": "INTEGER", "meta": "TEXT", "error": "TEXT",
+        "added_at": "TEXT", "updated_at": "TEXT",
+    }
 
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(path, timeout=60, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS pages (
+                page INTEGER PRIMARY KEY, status TEXT, n_links INTEGER, n_new INTEGER,
+                attempts INTEGER DEFAULT 0, error TEXT, updated_at TEXT);
+            CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+        """)
+        # migrasi: tambahkan kolom yang belum ada (mis. DB dari versi lama)
+        have = {row[1] for row in self.conn.execute("PRAGMA table_info(docs)")}
+        for col, decl in self.DOC_COLUMNS.items():
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE docs ADD COLUMN {col} {decl}")
+        have = {row[1] for row in self.conn.execute("PRAGMA table_info(pages)")}
+        for col, decl in {"n_new": "INTEGER", "attempts": "INTEGER DEFAULT 0", "error": "TEXT"}.items():
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE pages ADD COLUMN {col} {decl}")
+        self.conn.executescript("""
+            CREATE INDEX IF NOT EXISTS docs_queue ON docs(status, next_try);
+            CREATE INDEX IF NOT EXISTS docs_updated ON docs(status, updated_at);
+        """)
+        self.conn.commit()
 
-db_lock = threading.Lock()
+    def execute(self, sql, args=()):
+        with self.lock:
+            cur = self.conn.execute(sql, args)
+            self.conn.commit()
+            return cur
 
+    def query(self, sql, args=()):
+        with self.lock:
+            return self.conn.execute(sql, args).fetchall()
 
-def db_exec(conn, sql, args=()):
-    with db_lock:
-        conn.execute(sql, args)
-        conn.commit()
+    def scalar(self, sql, args=()):
+        rows = self.query(sql, args)
+        return rows[0][0] if rows else None
+
+    def get_kv(self, key, default=None):
+        value = self.scalar("SELECT v FROM kv WHERE k=?", (key,))
+        return default if value is None else value
+
+    def set_kv(self, key, value):
+        self.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (key, str(value)))
+
+    def add_docs(self, items):
+        """Simpan putusan dari halaman daftar; kembalikan jumlah yang baru."""
+        with self.lock:
+            before = self.conn.total_changes
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO docs (id, url, judul, tgl_register, tgl_putus, tgl_upload, added_at) "
+                "VALUES (:id, :url, :judul, :tgl_register, :tgl_putus, :tgl_upload, :added_at)",
+                [dict(item, added_at=now_str()) for item in items])
+            self.conn.commit()
+            return self.conn.total_changes - before
 
 
 # ---------------------------------------------------------------- HTTP client
-class BlockedError(Exception):
-    pass
+class RateLimiter:
+    """Batas request global (semua thread) supaya server MA tidak terbebani."""
 
-
-class Client:
-    """Menyimpan cookie+UA bersama dan memperbaruinya otomatis saat diblokir."""
-
-    def __init__(self):
+    def __init__(self, per_sec):
+        self.interval = 1.0 / per_sec if per_sec > 0 else 0
         self.lock = threading.Lock()
-        self.cookies, self.user_agent = {}, ""
-        self.generation = 0
-        self.refresh(force=False)
+        self.next_at = 0.0
 
-    def refresh(self, force=True, seen_generation=None):
+    def wait(self, stop):
+        with self.lock:
+            now = time.monotonic()
+            at = max(now, self.next_at)
+            self.next_at = at + self.interval
+        if stop.wait(max(0.0, at - time.monotonic())):
+            raise Stopped()
+
+
+class Bypass:
+    """Cookie cf_clearance + User-Agent dari server bypass, dipakai semua thread."""
+
+    MIN_FORCE_INTERVAL = 60  # detik; cegah browser diluncurkan terus-menerus
+
+    def __init__(self, stop):
+        self.stop = stop
+        self.lock = threading.Lock()
+        self.cookies, self.user_agent, self.generation = {}, "", 0
+        self.forced_at = 0.0
+
+    def refresh(self, seen_generation=None, force=False):
         with self.lock:
             # thread lain sudah memperbarui saat kita menunggu lock
             if seen_generation is not None and seen_generation != self.generation:
                 return
-            if force:
-                # /cookies selalu mengembalikan cache (s.d. ~29 menit). Paksa
-                # pembuatan cookie baru lewat /html?bypassCookieCache=true.
-                log.warning("Clearance ditolak, memaksa pembuatan cookie baru...")
-                requests.get(f"{BYPASS_URL}/html", params={
-                    "url": BASE_URL, "bypassCookieCache": "true"}, timeout=180)
-            log.info("Meminta clearance dari bypass server...")
-            r = requests.get(f"{BYPASS_URL}/cookies", params={"url": BASE_URL}, timeout=180)
-            r.raise_for_status()
-            data = r.json()
-            self.cookies, self.user_agent = data["cookies"], data["user_agent"]
-            self.generation += 1
-            log.info("Clearance OK (cookie: %s)", ", ".join(self.cookies))
+            if force and self.stop.wait(max(0.0, self.forced_at + self.MIN_FORCE_INTERVAL - time.time())):
+                raise Stopped()
+            delay = 15
+            while not self.stop.is_set():
+                try:
+                    if force:
+                        # /cookies mengembalikan cache (s.d. ~29 menit) walau sudah
+                        # ditolak Cloudflare; /html?bypassCookieCache=true memaksa
+                        # browser membuat clearance baru dan memperbarui cache.
+                        log.warning("Clearance ditolak, membuat clearance baru...")
+                        self.forced_at = time.time()
+                        requests.get(f"{BYPASS_URL}/html", timeout=300, params={
+                            "url": BASE_URL + "/", "bypassCookieCache": "true"}).raise_for_status()
+                    r = requests.get(f"{BYPASS_URL}/cookies", params={"url": BASE_URL + "/"}, timeout=300)
+                    r.raise_for_status()
+                    data = r.json()
+                    self.cookies, self.user_agent = data["cookies"], data["user_agent"]
+                    self.generation += 1
+                    log.info("Clearance OK (cookie: %s)", ", ".join(sorted(self.cookies)) or "-")
+                    return
+                except requests.RequestException as e:
+                    log.error("Server bypass %s gagal: %s. Coba lagi dalam %ds", BYPASS_URL, e, delay)
+                    self.stop.wait(delay)
+                    delay = min(delay * 2, 600)
+            raise Stopped()
 
-    def get(self, url, **kw):
-        for attempt in range(3):
-            gen = self.generation
-            headers = {"User-Agent": self.user_agent, "Referer": BASE_URL + "/"}
+
+class Breaker:
+    """Jeda semua worker bila banyak kegagalan beruntun (situs down/IP dibatasi)."""
+
+    THRESHOLD, PAUSE = 10, 300
+
+    def __init__(self, stop):
+        self.stop, self.lock = stop, threading.Lock()
+        self.failures, self.pause_until = 0, 0.0
+
+    def ok(self):
+        with self.lock:
+            self.failures = 0
+
+    def fail(self):
+        with self.lock:
+            self.failures += 1
+            if self.failures >= self.THRESHOLD and time.time() >= self.pause_until:
+                log.error("%d kegagalan beruntun, jeda %d detik", self.failures, self.PAUSE)
+                self.pause_until = time.time() + self.PAUSE
+                self.failures = 0
+
+    def wait(self):
+        remaining = self.pause_until - time.time()
+        if remaining > 0 and self.stop.wait(remaining):
+            raise Stopped()
+
+
+def is_challenge(r):
+    if r.headers.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    if "text/html" not in r.headers.get("content-type", ""):
+        return False
+    head = r.text[:20000]
+    return any(m in head for m in CHALLENGE_MARKERS)
+
+
+class Http:
+    def __init__(self, stop):
+        self.stop = stop
+        self.bypass = Bypass(stop)
+        self.limiter = RateLimiter(REQ_PER_SEC)
+        self.breaker = Breaker(stop)
+        self.local = threading.local()
+
+    def _session(self):
+        # satu sesi per thread (koneksi keep-alive); dibuat ulang tiap clearance baru
+        st = self.local
+        if getattr(st, "generation", None) != self.bypass.generation:
+            st.session = cffi.Session(impersonate="chrome") if cffi else requests.Session()
+            st.generation = self.bypass.generation
+        return st.session
+
+    def get(self, url, referer=None):
+        if self.bypass.generation == 0:
+            self.bypass.refresh(seen_generation=0)
+        last_error = None
+        for attempt in range(4):
+            self.breaker.wait()
+            self.limiter.wait(self.stop)
+            generation = self.bypass.generation
+            headers = {"User-Agent": self.bypass.user_agent, "Referer": referer or BASE_URL + "/",
+                       "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"}
             try:
-                r = http.get(url, headers=headers, cookies=self.cookies,
-                             timeout=TIMEOUT, **IMPERSONATE, **kw)
+                r = self._session().get(url, headers=headers, cookies=self.bypass.cookies, timeout=TIMEOUT)
             except Exception as e:
-                log.warning("Error jaringan %s: %s", url, e)
-                time.sleep(5 * (attempt + 1))
-                continue
-            ctype = r.headers.get("content-type", "")
-            blocked = r.status_code in (403, 503) or (
-                "text/html" in ctype and any(m in r.text[:5000] for m in CHALLENGE_MARKERS))
-            if blocked:
-                self.refresh(force=True, seen_generation=gen)
-                continue
-            if r.status_code == 429:
-                wait = int(r.headers.get("retry-after", 60))
-                log.warning("429 Too Many Requests, tidur %ss", wait)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r
-        raise BlockedError(f"Gagal mengambil {url} setelah 3 percobaan")
-
-
-def polite_sleep():
-    time.sleep(DELAY + random.uniform(0, DELAY / 2))
+                last_error = f"jaringan: {e}"
+            else:
+                if is_challenge(r):
+                    last_error = f"diblokir Cloudflare (HTTP {r.status_code})"
+                    self.bypass.refresh(seen_generation=generation, force=True)
+                    continue
+                if r.status_code == 404:
+                    self.breaker.ok()
+                    raise ParseError("HTTP 404")
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_error = f"HTTP {r.status_code}"
+                    wait = int(r.headers.get("retry-after", "0") or 0) if r.status_code == 429 else 0
+                    if self.stop.wait(max(wait, 10 * (attempt + 1))):
+                        raise Stopped()
+                    continue
+                if r.status_code >= 400:
+                    raise ParseError(f"HTTP {r.status_code}")
+                self.breaker.ok()
+                return r
+            if self.stop.wait(5 * (attempt + 1)):
+                raise Stopped()
+        self.breaker.fail()
+        raise TransientError(f"{url}: {last_error}")
 
 
 # --------------------------------------------------------------------- parsing
-def find_detail_links(html):
-    soup = BeautifulSoup(html, "html.parser")
-    hrefs = [a.get("href", "") for a in soup.select(SEL_DETAIL)]
-    if not any(RE_DETAIL.search(h) for h in hrefs):
-        hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    out = {}
-    for h in hrefs:
-        m = RE_DETAIL.search(h)
-        if m:
-            out[m.group(1)] = urljoin(BASE_URL, h)
-    return out
+def list_url(page):
+    return f"{BASE_URL}{LIST_PATH}.html" if page == 1 else f"{BASE_URL}{LIST_PATH}/page/{page}.html"
 
 
-def find_pdf_link(html):
+def parse_list(html):
+    """Kembalikan (daftar putusan, nomor halaman terakhir) dari halaman daftar."""
     soup = BeautifulSoup(html, "html.parser")
-    a = soup.select_one(SEL_PDF)
-    if a is None:
-        a = next((x for x in soup.find_all("a", href=True) if RE_PDF.search(x["href"])), None)
-    return urljoin(BASE_URL, a["href"]) if a else None
+    items, seen = [], set()
+    for entry in soup.select(SEL_LIST_ITEM):
+        link = entry.select_one("strong > a[href*='/direktori/putusan/']") or \
+            next((a for a in entry.find_all("a", href=True) if RE_DETAIL.search(a["href"])), None)
+        match = RE_DETAIL.search(link["href"]) if link else None
+        if not match or match.group(1) in seen:
+            continue
+        seen.add(match.group(1))
+        dates = dict(RE_LIST_DATE.findall(entry.get_text(" ", strip=True)))
+        items.append({
+            "id": match.group(1), "url": urljoin(BASE_URL + "/", link["href"]),
+            "judul": link.get_text(" ", strip=True), "tgl_register": dates.get("Register"),
+            "tgl_putus": dates.get("Putus"), "tgl_upload": dates.get("Upload"),
+        })
+    last = 1
+    for a in soup.select("a.page-link"):
+        value = a.get("data-ci-pagination-page") or ""
+        match = re.search(r"/page/(\d+)\.html", a.get("href", ""))
+        for candidate in (value, match.group(1) if match else ""):
+            if candidate.isdigit():
+                last = max(last, int(candidate))
+    return items, last
+
+
+def parse_detail(html):
+    """Kembalikan (metadata, url pdf, nama file pdf asli) dari halaman detail."""
+    soup = BeautifulSoup(html, "html.parser")
+    meta = {}
+    table = soup.select_one("table.table")
+    if table is not None:
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) >= 2:
+                key = tds[0].get_text(" ", strip=True)
+                if key and len(key) <= 40:
+                    meta[key] = tds[1].get_text(" ", strip=True)
+    link = soup.select_one(SEL_PDF)
+    if link is None:
+        return meta, None, None
+    return meta, urljoin(BASE_URL + "/", link["href"]), link.get_text(" ", strip=True) or None
 
 
 def pdf_path(doc_id):
-    # 900rb file dalam satu folder memperlambat filesystem; pecah per 2 karakter.
-    sub = os.path.join(DOWNLOAD_DIR, doc_id[:2])
-    os.makedirs(sub, exist_ok=True)
-    return os.path.join(sub, doc_id + ".pdf")
+    # ID putusan berbasis waktu (awalannya mirip), jadi folder dibagi pakai hash
+    # agar ±900rb file tersebar rata ke 256 folder.
+    shard = hashlib.md5(doc_id.encode()).hexdigest()[:2]
+    return os.path.join(DOWNLOAD_DIR, "pdf", shard, doc_id + ".pdf")
 
 
-# --------------------------------------------------------------------- fase 1
-def crawl(conn, client):
-    row = conn.execute("SELECT MAX(page) FROM pages WHERE status='DONE'").fetchone()
-    page = (row[0] or 0) + 1
-    empty_streak = 0
-    while empty_streak < 3:
-        url = LIST_URL.format(year=YEAR, page=page)
-        try:
-            links = find_detail_links(client.get(url).text)
-        except Exception as e:
-            log.error("Halaman %d gagal: %s (lanjut lagi nanti)", page, e)
-            time.sleep(60)
+# ---------------------------------------------------------------------- crawl
+def crawl(db, http, stop):
+    """Telusuri semua halaman daftar yang belum selesai."""
+    first = http.get(list_url(1))
+    items, last = parse_list(first.text)
+    if not items:
+        raise ParseError(f"Tidak ada putusan di {list_url(1)}. Struktur HTML berubah? Cek SEL_LIST_ITEM.")
+    db.set_kv("last_page", last)
+    done = {row[0] for row in db.query("SELECT page FROM pages WHERE status IN ('DONE', 'FAILED')")}
+    log.info("Crawl: %d halaman (±%d putusan), %d sudah selesai", last, last * 20, len(done))
+    page = 1
+    while page <= last and not stop.is_set():
+        if page in done:
+            page += 1
             continue
-        with db_lock:
-            conn.executemany("INSERT OR IGNORE INTO docs (id, url) VALUES (?, ?)", links.items())
-            conn.execute("INSERT OR REPLACE INTO pages VALUES (?, 'DONE', ?, datetime('now','localtime'))",
-                         (page, len(links)))
-            conn.commit()
-        log.info("Halaman %d: %d putusan", page, len(links))
-        empty_streak = empty_streak + 1 if not links else 0
+        try:
+            html = first.text if page == 1 else http.get(list_url(page), referer=list_url(page - 1)).text
+            items, page_last = parse_list(html)
+            if not items:
+                raise ParseError("halaman daftar kosong")
+            n_new = db.add_docs(items)
+            db.execute("INSERT OR REPLACE INTO pages (page, status, n_links, n_new, attempts, error, updated_at) "
+                       "VALUES (?, 'DONE', ?, ?, 0, NULL, ?)", (page, len(items), n_new, now_str()))
+            if page_last > last:
+                last = page_last
+                db.set_kv("last_page", last)
+            if page % 50 == 0 or page == last:
+                log.info("Crawl halaman %d/%d (+%d putusan baru)", page, last, n_new)
+        except Stopped:
+            break
+        except (TransientError, ParseError) as e:
+            attempts = (db.scalar("SELECT attempts FROM pages WHERE page=?", (page,)) or 0) + 1
+            status = "FAILED" if attempts >= MAX_ATTEMPTS else "PENDING"
+            db.execute("INSERT OR REPLACE INTO pages (page, status, attempts, error, updated_at) "
+                       "VALUES (?, ?, ?, ?, ?)", (page, status, attempts, str(e)[:500], now_str()))
+            log.warning("Halaman %d gagal (%d/%d): %s", page, attempts, MAX_ATTEMPTS, e)
+            if status == "PENDING":
+                stop.wait(30)
+                continue
         page += 1
-        polite_sleep()
-    log.info("Crawl selesai di halaman %d", page - 1)
+    if not stop.is_set():
+        db.set_kv("crawl_finished", now_str())
+        log.info("Crawl selesai sampai halaman %d", last)
 
 
-# --------------------------------------------------------------------- fase 2
-def download_one(conn, client, doc_id, url):
+def update(db, http, stop, quiet_pages=3):
+    """Daftar diurutkan dari unggahan terbaru: telusuri dari halaman 1 sampai
+    beberapa halaman berturut-turut tidak berisi putusan baru."""
+    page, quiet, total_new = 1, 0, 0
+    while quiet < quiet_pages and not stop.is_set():
+        try:
+            items, last = parse_list(http.get(list_url(page)).text)
+        except Stopped:
+            break
+        except (TransientError, ParseError) as e:
+            log.warning("Update berhenti di halaman %d: %s", page, e)
+            break
+        n_new = db.add_docs(items)
+        total_new += n_new
+        quiet = quiet + 1 if n_new == 0 else 0
+        if not items or page >= last:
+            break
+        page += 1
+    log.info("Update: %d putusan baru dari %d halaman awal", total_new, page)
+
+
+# ------------------------------------------------------------------- download
+def wait_for_disk(stop):
+    warned = False
+    while shutil.disk_usage(DOWNLOAD_DIR).free < MIN_FREE_GB * 1024 ** 3:
+        if not warned:
+            log.error("Sisa disk < %.1f GB, unduhan dijeda sampai ada ruang kosong", MIN_FREE_GB)
+            warned = True
+        if stop.wait(300):
+            raise Stopped()
+
+
+def download_one(db, http, stop, doc_id, url):
     path = pdf_path(doc_id)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        db.execute("UPDATE docs SET status='DONE', file=?, size=?, updated_at=? WHERE id=?",
+                   (path, os.path.getsize(path), now_str(), doc_id))
+        return
     try:
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            db_exec(conn, "UPDATE docs SET status='DONE', file=? WHERE id=?", (path, doc_id))
-            return
-        pdf_url = find_pdf_link(client.get(url).text)
-        polite_sleep()
+        wait_for_disk(stop)
+        meta, pdf_url, nama_file = parse_detail(http.get(url).text)
+        if not meta:
+            raise ParseError("halaman detail tanpa tabel metadata")
+        db.execute("UPDATE docs SET nomor=?, meta=?, pdf_url=?, nama_file=? WHERE id=?",
+                   (meta.get("Nomor"), json.dumps(meta, ensure_ascii=False), pdf_url, nama_file, doc_id))
         if not pdf_url:
-            db_exec(conn, "UPDATE docs SET status='NO_PDF', updated_at=datetime('now','localtime') WHERE id=?", (doc_id,))
+            db.execute("UPDATE docs SET status='NO_PDF', error=NULL, updated_at=? WHERE id=?", (now_str(), doc_id))
             return
-        r = client.get(pdf_url)
+        r = http.get(pdf_url, referer=url)
         body = r.content
-        # tanpa cek ini, halaman challenge/error HTML bisa tersimpan sebagai .pdf
+        # tanpa cek ini, halaman error HTML bisa tersimpan sebagai .pdf
         if not body.startswith(b"%PDF"):
-            raise ValueError(f"bukan PDF (content-type={r.headers.get('content-type')})")
+            raise ParseError(f"bukan PDF (content-type={r.headers.get('content-type')}, {len(body)} byte)")
+        expected = r.headers.get("content-length")
+        if expected and expected.isdigit() and int(expected) != len(body):
+            raise TransientError(f"unduhan terpotong ({len(body)}/{expected} byte)")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".part"
         with open(tmp, "wb") as f:
             f.write(body)
         os.replace(tmp, path)
-        db_exec(conn, "UPDATE docs SET status='DONE', file=?, size=?, error=NULL, "
-                      "updated_at=datetime('now','localtime') WHERE id=?", (path, len(body), doc_id))
-    except Exception as e:
-        log.warning("Gagal %s: %s", doc_id, e)
-        db_exec(conn, "UPDATE docs SET attempts=attempts+1, error=?, status=CASE WHEN attempts+1>=? "
-                      "THEN 'FAILED' ELSE 'PENDING' END, updated_at=datetime('now','localtime') WHERE id=?",
-                (str(e)[:500], MAX_ATTEMPTS, doc_id))
+        db.execute("UPDATE docs SET status='DONE', file=?, size=?, error=NULL, updated_at=? WHERE id=?",
+                   (path, len(body), now_str(), doc_id))
+    except (TransientError, ParseError, OSError) as e:
+        attempts = (db.scalar("SELECT attempts FROM docs WHERE id=?", (doc_id,)) or 0) + 1
+        status = "FAILED" if attempts >= MAX_ATTEMPTS else "PENDING"
+        # coba lagi nanti dengan jeda bertambah: 10, 20, 40, 80 menit
+        next_try = time.time() + 600 * 2 ** (attempts - 1)
+        db.execute("UPDATE docs SET status=?, attempts=?, next_try=?, error=?, updated_at=? WHERE id=?",
+                   (status, attempts, next_try, str(e)[:500], now_str(), doc_id))
+        log.warning("Gagal %s (%d/%d): %s", doc_id, attempts, MAX_ATTEMPTS, e)
+
+
+def download(db, http, stop, crawl_done):
+    """Ambil antrean PENDING dari DB dan bagikan ke WORKERS thread."""
+    jobs = queue.Queue(maxsize=WORKERS * 2)
+    inflight, inflight_lock = set(), threading.Lock()
+
+    def worker():
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            try:
+                if not stop.is_set():
+                    download_one(db, http, stop, *job)
+            except Stopped:
+                pass
+            except Exception:
+                log.exception("Error tak terduga pada %s", job[0])
+            finally:
+                with inflight_lock:
+                    inflight.discard(job[0])
+
+    threads = [threading.Thread(target=worker, name=f"dl-{i}", daemon=True) for i in range(WORKERS)]
+    for t in threads:
+        t.start()
+    try:
+        while not stop.is_set():
+            rows = db.query("SELECT id, url FROM docs WHERE status='PENDING' AND next_try<=? "
+                            "ORDER BY next_try, rowid LIMIT 200", (time.time(),))
+            with inflight_lock:
+                rows = [row for row in rows if row[0] not in inflight]
+                inflight.update(row[0] for row in rows)
+            for row in rows:
+                while not stop.is_set():
+                    try:
+                        jobs.put(row, timeout=1)
+                        break
+                    except queue.Full:
+                        pass
+            if rows:
+                continue
+            with inflight_lock:
+                busy = bool(inflight)
+            pending = db.scalar("SELECT COUNT(*) FROM docs WHERE status='PENDING'")
+            if crawl_done.is_set() and not busy and pending == 0:
+                log.info("Semua putusan sudah diproses.")
+                break
+            stop.wait(2 if not crawl_done.is_set() else 10)
     finally:
-        polite_sleep()
+        for _ in threads:
+            jobs.put(None)
+        for t in threads:
+            t.join()
 
 
-def download(conn, client):
-    while True:
-        batch = conn.execute("SELECT id, url FROM docs WHERE status='PENDING' "
-                             "ORDER BY attempts, rowid LIMIT 500").fetchall()
-        if not batch:
-            break
-        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            for doc_id, url in batch:
-                pool.submit(download_one, conn, client, doc_id, url)
-        stats(conn)
-    log.info("Tidak ada lagi putusan PENDING.")
+# ---------------------------------------------------------- statistik/laporan
+def collect_stats(db):
+    counts = dict(db.query("SELECT status, COUNT(*) FROM docs GROUP BY status"))
+    hour_ago = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 3600))
+    day_ago = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400))
+    last_page = int(db.get_kv("last_page", 0))
+    s = {
+        "total": sum(counts.values()),
+        "done": counts.get("DONE", 0), "pending": counts.get("PENDING", 0),
+        "failed": counts.get("FAILED", 0), "no_pdf": counts.get("NO_PDF", 0),
+        "last_hour": db.scalar("SELECT COUNT(*) FROM docs WHERE status='DONE' AND updated_at>=?", (hour_ago,)),
+        "last_day": db.scalar("SELECT COUNT(*) FROM docs WHERE status='DONE' AND updated_at>=?", (day_ago,)),
+        "bytes": db.scalar("SELECT COALESCE(SUM(size), 0) FROM docs WHERE status='DONE'"),
+        "pages_done": db.scalar("SELECT COUNT(*) FROM pages WHERE status='DONE'"),
+        "pages_failed": db.scalar("SELECT COUNT(*) FROM pages WHERE status='FAILED'"),
+        "last_page": last_page,
+        "crawl_finished": db.get_kv("crawl_finished"),
+        "heartbeat": float(db.get_kv("heartbeat", 0)),
+        "disk_free": shutil.disk_usage(DOWNLOAD_DIR).free,
+    }
+    # perkiraan total: dari crawl bila sudah selesai, kalau belum dari jumlah halaman
+    s["estimate"] = s["total"] if s["crawl_finished"] else max(s["total"], last_page * 20)
+    remaining = s["estimate"] - s["done"] - s["no_pdf"] - s["failed"]
+    # pakai laju 1 jam terakhir (paling mutakhir), atau rata-rata 24 jam
+    per_hour = s["last_hour"] or s["last_day"] / 24
+    s["eta_hours"] = remaining / per_hour if per_hour else None
+    return s
 
 
-def stats(conn):
-    rows = conn.execute("SELECT status, COUNT(*) FROM docs GROUP BY status").fetchall()
-    pages = conn.execute("SELECT COUNT(*) FROM pages WHERE status='DONE'").fetchone()[0]
-    log.info("Halaman: %d | %s", pages, " | ".join(f"{s}: {n}" for s, n in rows))
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}"
+        n /= 1024
 
 
-def main():
+def format_stats(s):
+    if s["heartbeat"] and time.time() - s["heartbeat"] < 180:
+        bot = "BERJALAN"
+    elif s["heartbeat"]:
+        bot = "BERHENTI sejak " + time.strftime("%d-%m %H:%M", time.localtime(s["heartbeat"]))
+    else:
+        bot = "belum pernah jalan"
+    try:
+        requests.get(f"{BYPASS_URL}/cache/stats", timeout=10).raise_for_status()
+        bypass = "OK"
+    except requests.RequestException:
+        bypass = "MATI"
+    pct = 100 * s["done"] / s["estimate"] if s["estimate"] else 0
+    crawl = "selesai" if s["crawl_finished"] else f"{s['pages_done']}/{s['last_page'] or '?'} halaman"
+    if s["eta_hours"] is None:
+        eta = "-"
+    elif s["eta_hours"] < 48:
+        eta = f"±{s['eta_hours']:.0f} jam"
+    else:
+        eta = f"±{s['eta_hours'] / 24:.1f} hari"
+    avg = human_bytes(s["bytes"] / s["done"]) if s["done"] else "-"
+    return "\n".join([
+        f"Laporan Bot Putusan MA {YEAR} ({time.strftime('%d-%m-%Y %H:%M')})",
+        f"- Terunduh: {s['done']:,} / ±{s['estimate']:,} ({pct:.1f}%)",
+        f"- 24 jam terakhir: +{s['last_day']:,} | 1 jam terakhir: +{s['last_hour']:,}",
+        f"- Antre: {s['pending']:,} | Gagal: {s['failed']:,} | Tanpa PDF: {s['no_pdf']:,}",
+        f"- Crawl daftar: {crawl} (gagal: {s['pages_failed']})",
+        f"- Ukuran: {human_bytes(s['bytes'])} (rata-rata {avg}/file) | Sisa disk: {human_bytes(s['disk_free'])}",
+        f"- Perkiraan selesai: {eta}",
+        f"- Bot: {bot} | Server bypass: {bypass}",
+    ])
+
+
+def send_report(db):
+    text = format_stats(collect_stats(db))
+    print(text)
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        sys.exit("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum di-set (lihat .env.example)")
+    for attempt in range(3):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                              json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
+            if r.ok:
+                return
+            error = r.text
+        except requests.RequestException as e:
+            error = str(e)
+        time.sleep(10 * (attempt + 1))
+    sys.exit(f"Gagal mengirim laporan Telegram: {error}")
+
+
+def export_csv(db, path):
+    fields = ["Tingkat Proses", "Klasifikasi", "Lembaga Peradilan", "Tanggal Dibacakan", "Amar"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "nomor", "judul", "tgl_putus", "tgl_upload", *fields,
+                         "status", "file", "nama_file", "pdf_url", "url"])
+        rows = db.query("SELECT id, nomor, judul, tgl_putus, tgl_upload, meta, status, file, "
+                        "nama_file, pdf_url, url FROM docs ORDER BY rowid")
+        for row in rows:
+            meta = json.loads(row[5]) if row[5] else {}
+            writer.writerow([*row[:5], *(meta.get(k, "") for k in fields), *row[6:]])
+    print(f"{len(rows):,} baris diekspor ke {path}")
+
+
+# ----------------------------------------------------------------------- main
+def setup_logging():
+    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    logfile = logging.handlers.RotatingFileHandler(
+        os.path.join(DOWNLOAD_DIR, "bot.log"), maxBytes=20 * 1024 ** 2, backupCount=5, encoding="utf-8")
+    logfile.setFormatter(fmt)
+    root.addHandler(logfile)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Bot unduh putusan Mahkamah Agung")
+    parser.add_argument("command", nargs="?", default="run",
+                        choices=["run", "crawl", "download", "update", "stats", "report", "export", "retry-failed"])
+    parser.add_argument("output", nargs="?", help="file CSV untuk perintah export")
+    args = parser.parse_args(argv)
+
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
-    conn = db_connect()
-    if mode == "stats":
-        return stats(conn)
-    client = Client()
-    if mode in ("all", "crawl"):
-        crawl(conn, client)
-    if mode in ("all", "download"):
-        download(conn, client)
-    stats(conn)
+    db = DB(DB_NAME)
+    if args.command == "stats":
+        return print(format_stats(collect_stats(db)))
+    if args.command == "report":
+        return send_report(db)
+    if args.command == "export":
+        return export_csv(db, args.output or os.path.join(DOWNLOAD_DIR, "metadata.csv"))
+    if args.command == "retry-failed":
+        n = db.execute("UPDATE docs SET status='PENDING', attempts=0, next_try=0 WHERE status='FAILED'").rowcount
+        p = db.execute("DELETE FROM pages WHERE status='FAILED'").rowcount
+        if p:
+            db.execute("DELETE FROM kv WHERE k='crawl_finished'")
+        return print(f"{n:,} putusan dan {p:,} halaman diantrekan ulang")
+
+    setup_logging()
+    stop = threading.Event()
+
+    def on_signal(signum, _frame):
+        if stop.is_set():
+            os._exit(1)  # sinyal kedua: keluar paksa
+        log.warning("Berhenti... menunggu pekerjaan yang sedang berjalan (Ctrl+C lagi untuk paksa)")
+        stop.set()
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    def heartbeat():
+        while not stop.wait(60):
+            db.set_kv("heartbeat", time.time())
+
+    db.set_kv("heartbeat", time.time())
+    threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
+
+    log.info("Mulai '%s': tahun %s, %d worker, %.1f req/detik, simpan ke %s (%s)",
+             args.command, YEAR, WORKERS, REQ_PER_SEC, DOWNLOAD_DIR,
+             "curl_cffi" if cffi else "requests (pasang curl_cffi!)")
+    http = Http(stop)
+    crawl_done = threading.Event()
+    try:
+        if args.command == "update":
+            update(db, http, stop)
+        elif args.command == "crawl":
+            crawl(db, http, stop)
+        elif args.command == "download":
+            crawl_done.set()
+            download(db, http, stop, crawl_done)
+        else:
+            def crawl_thread():
+                # gagal crawl tidak menghentikan unduhan antrean yang sudah ada
+                try:
+                    for attempt in range(5):
+                        try:
+                            if db.get_kv("crawl_finished"):
+                                return update(db, http, stop)
+                            return crawl(db, http, stop)
+                        except TransientError as e:
+                            log.error("Crawl gagal (%s), coba lagi dalam 5 menit", e)
+                            if stop.wait(300):
+                                return
+                except Stopped:
+                    pass
+                except Exception:
+                    log.exception("Crawl berhenti karena error; unduhan antrean tetap jalan")
+                finally:
+                    crawl_done.set()
+
+            threading.Thread(target=crawl_thread, name="crawl", daemon=True).start()
+            download(db, http, stop, crawl_done)
+    except Stopped:
+        pass
+    finally:
+        stop.set()
+        log.info("\n%s", format_stats(collect_stats(db)))
 
 
 if __name__ == "__main__":

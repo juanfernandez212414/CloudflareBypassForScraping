@@ -1,0 +1,21 @@
+# Pasang (dari folder ini):
+#   sed -e "s|__DIR__|$PWD|g" -e "s|__USER__|$USER|g" bot-mahkamah.service \
+#     | sudo tee /etc/systemd/system/bot-mahkamah.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bot-mahkamah
+[Unit]
+Description=Bot unduh putusan Mahkamah Agung
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python bot_mahkamah.py run
+# restart otomatis bila crash/reboot; berhenti sendiri bila semua sudah selesai
+Restart=on-failure
+RestartSec=60
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

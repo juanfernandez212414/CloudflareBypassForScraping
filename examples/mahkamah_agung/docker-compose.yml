@@ -1,0 +1,18 @@
+# Server bypass untuk bot ini, disetel untuk mesin kecil (mis. VPS 2 GB RAM).
+# Bot hanya butuh clearance baru sesekali, jadi satu browser sudah cukup.
+services:
+  cloudflare-bypass:
+    image: ghcr.io/sarperavci/cloudflarebypassforscraping:latest
+    container_name: cloudflare-bypass
+    ports:
+      # hanya localhost: jika dibuka ke 0.0.0.0, siapa pun di internet bisa
+      # memakai server ini sebagai proxy lewat IP Anda
+      - "127.0.0.1:8000:8000"
+    environment:
+      - CF_MAX_CONCURRENT_BROWSERS=1
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    shm_size: 512m
+    restart: unless-stopped
