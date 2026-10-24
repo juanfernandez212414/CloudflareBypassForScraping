@@ -175,7 +175,7 @@ def stub():
 
 def run_bot(base, tmp_path, *args):
     env = dict(os.environ, MA_BASE_URL=base, BYPASS_URL=base, MA_YEAR="2025", MA_CAP_PAGES=str(CAP),
-               DOWNLOAD_DIR=str(tmp_path), REQ_PER_SEC="100", WORKERS="3", MAX_ATTEMPTS="1",
+               DOWNLOAD_DIR=str(tmp_path), REQ_PER_SEC="100", WORKERS="3", CRAWL_WORKERS="3", MAX_ATTEMPTS="1",
                MIN_FREE_GB="0", NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
     return subprocess.run([sys.executable, os.path.join(HERE, "bot_mahkamah.py"), *args],
                           env=env, capture_output=True, text=True, timeout=120)
@@ -267,6 +267,7 @@ def test_end_to_end(stub, tmp_path):
     assert f"Putusan terdaftar: {len(DOCS)} dari ±{len(DOCS)} di situs" in stats
     assert "Server bypass: OK" in stats
     assert "Target 7 hari: paling lambat" in stats
+    assert "Situs (10 mnt):" in stats and "respons: daftar" in stats
 
     # laporan ditulis ke file (laporan akhir tiap run + perintah report)
     report = tmp_path / "laporan.log"
@@ -303,6 +304,7 @@ def test_check_command(stub, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SEMUA OK" in result.stdout
     assert "per pengadilan: 3 bagian" in result.stdout
+    assert "[OK] Uji paralel: 4 halaman detail bersamaan" in result.stdout
     assert (tmp_path / "cek_contoh.pdf").read_bytes().startswith(b"%PDF")
     # uji awal tidak mengubah progres maupun memulai hitungan target 7 hari
     db = sqlite3.connect(tmp_path / "bot_state.db")

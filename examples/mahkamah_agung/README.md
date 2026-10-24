@@ -203,7 +203,8 @@ Perintah lain:
 | `MA_YEAR` | `2025` | Tahun putusan |
 | `DOWNLOAD_DIR` | `/mnt/data_1_5TB/putusan_<tahun>` | Folder PDF, log, dan (default) database |
 | `DB_NAME` | `<DOWNLOAD_DIR>/bot_state.db` | Database progres |
-| `WORKERS` | `8` | Unduhan paralel |
+| `WORKERS` | `24` | Unduhan paralel (koneksi bersamaan untuk halaman detail + PDF) |
+| `CRAWL_WORKERS` | `6` | Bagian daftar yang ditelusuri bersamaan |
 | `REQ_PER_SEC` | `4` | Batas total request per detik ke situs MA |
 | `TARGET_DAYS` | `7` | Target selesai, dihitung sejak bot pertama kali jalan |
 | `REPORT_FILE` | `<DOWNLOAD_DIR>/laporan.log` | File laporan progres |
@@ -215,25 +216,40 @@ Perintah lain:
 
 ## Target 7 hari
 
-Satu putusan butuh 2 request (halaman detail + PDF), ditambah ±47 ribu request
-untuk halaman daftar (±45 ribu halaman, plus halaman pertama tiap bagian). Pengaturan bawaan `REQ_PER_SEC=4` berarti ±2 putusan per
-detik atau ±170 ribu per hari. Dengan begitu, 900 ribu putusan selesai dalam
-**±5,5 hari**, dan masih ada cadangan ±1,5 hari untuk gangguan (Cloudflare,
-server MA lambat, listrik/internet mati).
+Tahun 2025 berisi **977.993 putusan** (angka dari situs saat uji awal). Satu
+putusan butuh 2 request (halaman detail + PDF), ditambah ±50 ribu request
+untuk halaman daftar. Pada `REQ_PER_SEC=4` (±2 putusan/detik, ±170 ribu per
+hari), unduhan selesai dalam **±5,8 hari**, dengan cadangan ±1 hari untuk
+gangguan.
 
 Bagian Target di laporan menunjukkan apakah jadwal tercapai:
 
 - **AMAN**: laju 1 jam terakhir sudah cukup untuk selesai sebelum tenggat.
-- **TERTINGGAL**: naikkan `REQ_PER_SEC` (mis. ke 5) dan `WORKERS` (mis. ke 10)
-  di `.env`, lalu `sudo systemctl restart bot-mahkamah`. Sebelum itu, cek dulu
+- **TERTINGGAL**: lihat dulu baris **Situs** dan **Saran** di laporan (lihat
+  di bawah). Bila laju `req/dtk` jauh di bawah batasnya, naikkan `WORKERS`
+  sesuai saran. Bila laju sudah mendekati batasnya, naikkan `REQ_PER_SEC`
+  (mis. ke 5). Setelah mengubah `.env`, jalankan
+  `sudo systemctl restart bot-mahkamah`. Sebelum itu, cek dulu
   apakah jumlah `Gagal` melonjak atau log berisi `kegagalan beruntun`. Kalau
   ya, masalahnya pemblokiran, bukan kecepatan, dan menaikkan kecepatan justru
   memperparah.
 
-Kecepatan nyata juga dibatasi oleh seberapa cepat server MA merespons. Jika
-server butuh rata-rata lebih dari ±2 detik per request, 8 worker tidak cukup
-untuk mencapai 4 req/detik, dan hal itu akan terlihat sebagai laju di bawah
-target. Karena itu, cek laporan pada jam-jam pertama.
+**Situs MA lambat.** Pada uji awal, satu request rata-rata butuh ±20 detik.
+Karena itu `REQ_PER_SEC` hanya tercapai bila cukup banyak koneksi berjalan
+bersamaan, kira-kira `REQ_PER_SEC × detik per request`. Laporan menampilkan
+angkanya:
+
+```
+- Situs (10 mnt): 3.85 req/dtk dari batas 4 | respons: daftar 18.2 dtk, detail 4.1 dtk, PDF 2.3 dtk
+- Gangguan (10 mnt): tidak ada
+- Saran: situs lambat (±9 dtk/request); untuk 4 req/dtk perlu ±44 koneksi bersamaan, sekarang 30. ...
+```
+
+Perintah `check` juga mengukur hal ini (langkah **Uji paralel**) sebelum bot
+dijalankan. Di baris **Gangguan**, `blokir` berarti Cloudflare menolak dan
+`429`/`5xx` berarti server MA kewalahan. Bila angka-angka ini naik setelah
+`WORKERS` dinaikkan, turunkan lagi: pemblokiran tidak bisa diatasi dengan
+menambah kecepatan.
 
 Komputer, Docker, dan bot harus menyala terus selama 7 hari. Gunakan service
 systemd di atas supaya bot otomatis jalan lagi setelah reboot.

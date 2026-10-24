@@ -28,11 +28,13 @@ Perintah:
   python bot_mahkamah.py check        uji awal ±1 menit (bypass, daftar, detail, 1 PDF)
 """
 import argparse
+import collections
 import csv
 import hashlib
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import re
@@ -80,7 +82,10 @@ DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", f"/mnt/data_1_5TB/putusan_{YEAR}")
 DB_NAME = os.environ.get("DB_NAME", os.path.join(DOWNLOAD_DIR, "bot_state.db"))
 # Tiap putusan = 2 request (halaman detail + PDF). 4 req/detik ~ 2 putusan/detik
 # ~ 170 rb/hari, jadi 900 rb putusan selesai ±5,5 hari (sisa waktu untuk gangguan).
-WORKERS = int(os.environ.get("WORKERS", "8"))             # unduhan paralel
+# Situs MA bisa lambat (uji awal: ±20 detik/request), jadi butuh banyak koneksi
+# bersamaan untuk mencapai REQ_PER_SEC; batas sebenarnya tetap REQ_PER_SEC.
+WORKERS = int(os.environ.get("WORKERS", "24"))            # unduhan paralel
+CRAWL_WORKERS = int(os.environ.get("CRAWL_WORKERS", "6"))  # halaman daftar paralel
 REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "4"))    # batas total request ke situs MA
 TARGET_DAYS = float(os.environ.get("TARGET_DAYS", "7"))   # target selesai sejak bot pertama jalan
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "5"))
@@ -301,12 +306,50 @@ def is_challenge(r):
     return any(m in head for m in CHALLENGE_MARKERS)
 
 
+class Metrics:
+    """Waktu respons & hasil request 10 menit terakhir, per jenis halaman."""
+
+    WINDOW = 600
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = collections.deque()
+        self.started = time.time()
+
+    def add(self, url, seconds, outcome):
+        kind = "pdf" if "/download_file/" in url else "detail" if "/direktori/putusan/" in url else "daftar"
+        now = time.time()
+        with self.lock:
+            self.events.append((now, kind, seconds, outcome))
+            while self.events and self.events[0][0] < now - self.WINDOW:
+                self.events.popleft()
+
+    def summary(self):
+        now = time.time()
+        with self.lock:
+            events = [e for e in self.events if e[0] >= now - self.WINDOW]
+        span = max(1.0, min(self.WINDOW, now - self.started))
+        ok = [(kind, sec) for _, kind, sec, outcome in events if outcome == "ok"]
+        latency = {}
+        for kind in ("daftar", "detail", "pdf"):
+            times = [sec for k, sec in ok if k == kind]
+            if times:
+                latency[kind] = sum(times) / len(times)
+        return {
+            "at": now, "requests": len(events), "per_sec": len(events) / span, "latency": latency,
+            "avg": sum(sec for _, sec in ok) / len(ok) if ok else None,
+            "outcomes": dict(collections.Counter(e[3] for e in events if e[3] != "ok")),
+            "rate_limit": REQ_PER_SEC, "concurrency": WORKERS + CRAWL_WORKERS,
+        }
+
+
 class Http:
     def __init__(self, stop):
         self.stop = stop
         self.bypass = Bypass(stop)
         self.limiter = RateLimiter(REQ_PER_SEC)
         self.breaker = Breaker(stop)
+        self.metrics = Metrics()
         self.local = threading.local()
 
     def _session(self):
@@ -333,12 +376,19 @@ class Http:
             generation = self.bypass.generation
             headers = {"User-Agent": self.bypass.user_agent, "Referer": referer or BASE_URL + "/",
                        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"}
+            started = time.monotonic()
             try:
                 r = self._session().get(url, headers=headers, cookies=self.bypass.cookies, timeout=TIMEOUT)
             except Exception as e:
+                self.metrics.add(url, time.monotonic() - started, "jaringan")
                 last_error = f"jaringan: {e}"
             else:
-                if is_challenge(r):
+                elapsed = self.local.last_seconds = time.monotonic() - started
+                challenge = is_challenge(r)
+                code = r.status_code
+                self.metrics.add(url, elapsed, "blokir" if challenge else "ok" if code < 400 else
+                                 "5xx" if code >= 500 else str(code))
+                if challenge:
                     last_error = f"diblokir Cloudflare (HTTP {r.status_code})"
                     self.bypass.refresh(seen_generation=generation, force=True)
                     continue
@@ -579,33 +629,66 @@ def crawl_slice(db, http, stop, path, label, last):
         log.info("Bagian '%s' selesai: %d halaman, +%d putusan baru", label, last, found)
 
 
+def process_slice(db, http, stop, row):
+    path, label, depth, count, status, last = row
+    if status == "CRAWL":
+        return crawl_slice(db, http, stop, path, label, last or 1)
+    try:
+        analyse_slice(db, http, path, label, depth, count)
+    except Stopped:
+        return
+    except Exception as e:
+        if depth == 0 and isinstance(e, ParseError):
+            raise
+        attempts = (db.scalar("SELECT attempts FROM slices WHERE path=?", (path,)) or 0) + 1
+        status = "FAILED" if attempts >= MAX_ATTEMPTS else "NEW"
+        db.execute("UPDATE slices SET status=?, attempts=?, error=?, updated_at=? WHERE path=?",
+                   (status, attempts, str(e)[:500], now_str(), path))
+        log.warning("Bagian '%s' gagal dibuka (%d/%d): %s", label, attempts, MAX_ATTEMPTS, e)
+        if status == "NEW":
+            stop.wait(30)
+
+
 def crawl(db, http, stop):
-    """Telusuri daftar tahun ini, dipecah per bagian sampai semuanya selesai."""
+    """Telusuri daftar tahun ini, dipecah per bagian sampai semuanya selesai.
+    CRAWL_WORKERS bagian ditelusuri bersamaan (tiap bagian oleh satu thread)."""
     db.execute("INSERT OR IGNORE INTO slices (path, label, depth, updated_at) VALUES (?, ?, 0, ?)",
                (ROOT_PATH, f"Tahun {YEAR}", now_str()))
-    while not stop.is_set():
-        rows = db.query("SELECT path, label, depth, count, status, last_page FROM slices "
-                        "WHERE status IN ('NEW', 'CRAWL') ORDER BY rowid LIMIT 1")
-        if not rows:
-            break
-        path, label, depth, count, status, last = rows[0]
-        if status == "CRAWL":
-            crawl_slice(db, http, stop, path, label, last or 1)
-            continue
-        try:
-            analyse_slice(db, http, path, label, depth, count)
-        except Stopped:
-            return
-        except Exception as e:
-            if depth == 0 and isinstance(e, ParseError):
-                raise
-            attempts = (db.scalar("SELECT attempts FROM slices WHERE path=?", (path,)) or 0) + 1
-            status = "FAILED" if attempts >= MAX_ATTEMPTS else "NEW"
-            db.execute("UPDATE slices SET status=?, attempts=?, error=?, updated_at=? WHERE path=?",
-                       (status, attempts, str(e)[:500], now_str(), path))
-            log.warning("Bagian '%s' gagal dibuka (%d/%d): %s", label, attempts, MAX_ATTEMPTS, e)
-            if status == "NEW" and stop.wait(30):
-                return
+    lock, claimed, fatal = threading.Lock(), set(), []
+
+    def claim():
+        """Ambil bagian yang belum dikerjakan thread lain. (bagian, selesai_semua)"""
+        with lock:
+            for row in db.query("SELECT path, label, depth, count, status, last_page FROM slices "
+                                "WHERE status IN ('NEW', 'CRAWL') ORDER BY rowid"):
+                if row[0] not in claimed:
+                    claimed.add(row[0])
+                    return row, False
+            return None, not claimed
+
+    def worker():
+        while not stop.is_set() and not fatal:
+            row, finished = claim()
+            if row is None:
+                if finished:
+                    return
+                stop.wait(5)  # bagian lain sedang dibuka dan bisa menghasilkan bagian baru
+                continue
+            try:
+                process_slice(db, http, stop, row)
+            except Exception as e:
+                fatal.append(e)
+            finally:
+                with lock:
+                    claimed.discard(row[0])
+
+    threads = [threading.Thread(target=worker, name=f"crawl-{i}", daemon=True) for i in range(max(1, CRAWL_WORKERS))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if fatal:
+        raise fatal[0]
     if stop.is_set():
         return
     db.set_kv("crawl_finished", now_str())
@@ -773,6 +856,7 @@ def collect_stats(db):
         "slices_done": slices.get("DONE", 0) + slices.get("SPLIT", 0),
         "slices_failed": slices.get("FAILED", 0),
         "expected_total": int(db.get_kv("expected_total", 0)),
+        "http": json.loads(db.get_kv("http_metrics", "null") or "null"),
         "crawl_finished": db.get_kv("crawl_finished"),
         "heartbeat": float(db.get_kv("heartbeat", 0)),
         "stopped_at": float(db.get_kv("stopped_at", 0)),
@@ -815,6 +899,25 @@ def target_lines(s):
             f"- Laju sekarang: {s['per_hour']:,.0f}/jam | Laju minimal: {need:,.0f}/jam -> {verdict}"]
 
 
+def site_lines(s):
+    """Kecepatan & waktu respons situs (10 menit terakhir sebelum laporan bot)."""
+    m = s["http"]
+    if not m or not m["requests"]:
+        return []
+    names = {"daftar": "daftar", "detail": "detail", "pdf": "PDF"}
+    latency = ", ".join(f"{names[k]} {v:.1f} dtk" for k, v in m["latency"].items()) or "-"
+    issues = ", ".join(f"{k}: {v}" for k, v in sorted(m["outcomes"].items())) or "tidak ada"
+    lines = [f"- Situs (10 mnt): {m['per_sec']:.2f} req/dtk dari batas {m['rate_limit']:g} | respons: {latency}",
+             f"- Gangguan (10 mnt): {issues}"]
+    if m["avg"] and m["per_sec"] < 0.8 * m["rate_limit"]:
+        needed = math.ceil(m["rate_limit"] * m["avg"] * 1.2)
+        if needed > m["concurrency"]:
+            lines.append(f"- Saran: situs lambat (±{m['avg']:.0f} dtk/request); untuk {m['rate_limit']:g} req/dtk "
+                         f"perlu ±{needed} koneksi bersamaan, sekarang {m['concurrency']}. "
+                         f"Naikkan WORKERS di .env lalu restart.")
+    return lines
+
+
 def human_bytes(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -855,6 +958,7 @@ def format_stats(s):
         f"- Ukuran: {human_bytes(s['bytes'])} (rata-rata {avg}/file) | Sisa disk: {human_bytes(s['disk_free'])}",
         f"- Perkiraan selesai: {eta}",
         *target_lines(s),
+        *site_lines(s),
         f"- Bot: {bot} | Server bypass: {bypass}",
     ])
 
@@ -890,9 +994,11 @@ def check(http):
     Tidak mengubah database; contoh PDF disimpan ke DOWNLOAD_DIR/cek_contoh.pdf."""
     results = []
 
-    def report(ok, name, message):
+    def report(ok, name, message, timed=True):
         results.append(ok)
-        print(f"[{'OK' if ok else 'GAGAL'}] {name}: {message}", flush=True)
+        took = getattr(http.local, "last_seconds", None) if timed else None
+        http.local.last_seconds = None
+        print(f"[{'OK' if ok else 'GAGAL'}] {name}: {message}" + (f" ({took:.1f} dtk)" if took else ""), flush=True)
         return ok
 
     print(f"Uji awal: {BASE_URL}{ROOT_PATH}.html\n", flush=True)
@@ -906,9 +1012,11 @@ def check(http):
         names = ", ".join(sorted(data["cookies"])) or "-"
         report("cf_clearance" in data["cookies"], "Server bypass",
                f"cookie: {names}" + ("" if "cf_clearance" in data["cookies"]
-                                     else " (tidak ada cf_clearance; Cloudflare mungkin belum aktif atau gagal)"))
+                                     else " (tidak ada cf_clearance; Cloudflare mungkin belum aktif atau gagal)"),
+               timed=False)
     except Exception as e:
-        report(False, "Server bypass", f"{BYPASS_URL} tidak bisa dipakai: {e}. Sudah 'docker compose up -d'?")
+        report(False, "Server bypass", f"{BYPASS_URL} tidak bisa dipakai: {e}. Sudah 'docker compose up -d'?",
+               timed=False)
         return False
 
     # 2. halaman daftar tahun ini + filter sidebar
@@ -977,6 +1085,37 @@ def check(http):
     else:
         report(False, "Halaman detail", "5 putusan pertama tidak punya link PDF")
 
+    # 6. apakah situs tetap cepat bila dibuka bersamaan? (menentukan WORKERS)
+    urls = [item["url"] for item in items[:8]]
+    if len(urls) >= 2:
+        times, errors = [], []
+
+        def fetch(url):
+            try:
+                http.get(url)
+                times.append(http.local.last_seconds)
+            except Exception as e:
+                errors.append(e)
+
+        http.limiter = RateLimiter(max(REQ_PER_SEC, len(urls)))  # semua dimulai hampir bersamaan
+        started = time.monotonic()
+        threads = [threading.Thread(target=fetch, args=(u,)) for u in urls]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        wall = time.monotonic() - started
+        if times:
+            avg = sum(times) / len(times)
+            report(not errors, "Uji paralel",
+                   f"{len(urls)} halaman detail bersamaan selesai {wall:.1f} dtk, rata-rata {avg:.1f} dtk/request"
+                   + (f", {len(errors)} gagal" if errors else ""), timed=False)
+            needed = math.ceil(4 * avg * 1.2)
+            print(f"        Untuk 4 req/dtk (target 7 hari) dibutuhkan ±{needed} koneksi bersamaan "
+                  f"(WORKERS + CRAWL_WORKERS, sekarang {WORKERS} + {CRAWL_WORKERS}).")
+        else:
+            report(False, "Uji paralel", f"semua gagal: {errors[0]}", timed=False)
+
     ok = all(results)
     print("\nSEMUA OK: bot siap dijalankan." if ok else
           "\nADA YANG GAGAL: kirim seluruh output ini (dan bot.log) untuk diperbaiki.")
@@ -1043,13 +1182,16 @@ def main(argv=None):
             ok = False
         sys.exit(0 if ok else 1)
 
+    http = Http(stop)
+
     def heartbeat():
-        # tanda bot masih hidup (untuk status di laporan) + laporan berkala
+        # tanda bot masih hidup + metrik situs (untuk laporan) + laporan berkala
         minutes = 0
         while not stop.wait(60):
             minutes += 1
             try:
                 db.set_kv("heartbeat", time.time())
+                db.set_kv("http_metrics", json.dumps(http.metrics.summary()))
                 if REPORT_EVERY_MIN > 0 and minutes % REPORT_EVERY_MIN == 0:
                     log.info("Laporan:\n%s", write_report(db))
             except Exception:
@@ -1060,10 +1202,9 @@ def main(argv=None):
         db.set_kv("started_at", time.time())
     threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
 
-    log.info("Mulai '%s': tahun %s, %d worker, %.1f req/detik, simpan ke %s (%s)",
-             args.command, YEAR, WORKERS, REQ_PER_SEC, DOWNLOAD_DIR,
+    log.info("Mulai '%s': tahun %s, %d worker unduh + %d worker daftar, %.1f req/detik, simpan ke %s (%s)",
+             args.command, YEAR, WORKERS, CRAWL_WORKERS, REQ_PER_SEC, DOWNLOAD_DIR,
              "curl_cffi" if cffi else "requests (pasang curl_cffi!)")
-    http = Http(stop)
     crawl_done = threading.Event()
     try:
         if args.command == "update":
@@ -1102,6 +1243,7 @@ def main(argv=None):
         pass
     finally:
         stop.set()
+        db.set_kv("http_metrics", json.dumps(http.metrics.summary()))
         db.set_kv("stopped_at", time.time())
         log.info("Laporan akhir:\n%s", write_report(db))
 
